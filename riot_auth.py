@@ -87,6 +87,8 @@ def login(username: str, password: str, region: str = "na") -> dict:
     r = sess.put(f"{AUTH_BASE}/api/v1/authorization", json={
         "type": "auth", "username": username, "password": password, "remember": True,
     }, headers=_HEADERS, timeout=15)
+    if not r.ok:
+        raise ValueError(f"Credential PUT failed {r.status_code}: {r.text[:500]}")
     r.raise_for_status()
     data = r.json()
 
