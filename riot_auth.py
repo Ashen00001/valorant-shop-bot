@@ -69,7 +69,7 @@ def login(username: str, password: str, region: str = "na") -> dict:
     sess = requests.Session()
     nonce = secrets.token_hex(16)
 
-    sess.post(f"{AUTH_BASE}/api/v1/authorization", json={
+    _r0 = sess.post(f"{AUTH_BASE}/api/v1/authorization", json={
         "acr_values":           "",
         "claims":               "",
         "client_id":            "play-valorant-web-prod",
@@ -79,7 +79,10 @@ def login(username: str, password: str, region: str = "na") -> dict:
         "redirect_uri":         "https://playvalorant.com/opt_auth",
         "response_type":        "token id_token",
         "scope":                "account openid",
-    }, headers=_HEADERS, timeout=15).raise_for_status()
+    }, headers=_HEADERS, timeout=15)
+    if not _r0.ok:
+        raise ValueError(f"Auth init failed {_r0.status_code}: {_r0.text[:500]}")
+    _r0.raise_for_status()
 
     r = sess.put(f"{AUTH_BASE}/api/v1/authorization", json={
         "type": "auth", "username": username, "password": password, "remember": True,
