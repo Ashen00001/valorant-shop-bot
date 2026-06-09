@@ -3,7 +3,7 @@ Riot Games web auth — no Valorant client or lockfile needed.
 Stores cookies after first login; refreshes silently from then on.
 Cookies last ~30 days before re-login is required.
 """
-import re, json, requests
+import re, json, secrets, requests
 from pathlib import Path
 
 ACCOUNTS_FILE = Path(__file__).parent / "accounts.json"
@@ -12,8 +12,16 @@ ENTITLE_BASE  = "https://entitlements.auth.riotgames.com"
 
 # Riot blocks generic user agents — needs to look like the actual client
 _HEADERS = {
-    "Content-Type": "application/json",
-    "User-Agent":   "RiotClient/58.0.0.4640299.4552318 rso-auth (Windows;10;;Professional, x64)",
+    "Content-Type":    "application/json",
+    "Accept":          "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "User-Agent":      "RiotClient/68.0.0.4940199.4789131 rso-auth (Windows;10;;Professional, x64)",
+    "X-Riot-ClientPlatform": (
+        "ew0KCSJwbGF0Zm9ybVR5cGUiOiAiUEMiLA0KCSJwbGF0Zm9ybU9TIjogIldpbmRvd3MiLA0KCSJwbGF0"
+        "Zm9ybU9TVmVyc2lvbiI6ICIxMC4wLjE5MDQyLjEuMjU2LjY0Yml0IiwNCgkicGxhdGZvcm1DaGlwc2V0"
+        "IjogIlVua25vd24iDQp9"
+    ),
+    "X-Riot-ClientVersion": "release-08.07-shipping-9-2444158",
 }
 
 _mfa_sessions = {}  # username → (session, region) — alive during MFA flow
@@ -59,11 +67,18 @@ def login(username: str, password: str, region: str = "na") -> dict:
     Raises ValueError("MFA_REQUIRED") if 2FA is on; call login_mfa() next.
     """
     sess = requests.Session()
+    nonce = secrets.token_hex(16)
 
     sess.post(f"{AUTH_BASE}/api/v1/authorization", json={
-        "client_id": "play-valorant-web-prod", "nonce": "1",
-        "redirect_uri": "https://playvalorant.com/opt_auth",
-        "response_type": "token id_token", "scope": "account openid",
+        "acr_values":           "",
+        "claims":               "",
+        "client_id":            "play-valorant-web-prod",
+        "code_challenge":       "",
+        "code_challenge_method":"",
+        "nonce":                nonce,
+        "redirect_uri":         "https://playvalorant.com/opt_auth",
+        "response_type":        "token id_token",
+        "scope":                "account openid",
     }, headers=_HEADERS, timeout=15).raise_for_status()
 
     r = sess.put(f"{AUTH_BASE}/api/v1/authorization", json={
