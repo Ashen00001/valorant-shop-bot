@@ -1,30 +1,31 @@
 #!/usr/bin/env python3
 """
-Valorant Shop Bot — vacation edition
-Posts daily shop to Discord. 30-min window to respond, then PC sleeps.
-Wakes every 3h to re-check. Buy with: buy <name or #> → confirm
+Valorant Shop Bot — VPS / always-on edition
+Multi-user Discord bot. Checks daily shop + night market, lets you buy remotely.
+
+Commands (in the configured channel):
+  shop / s          — your daily shop
+  nm / nightmarket  — night market (if active)
+  buy <name or #>   — start purchase (works for both shop and NM)
+  confirm           — execute pending purchase
+  cancel            — cancel pending purchase
+
+Auto-posts your shop every day at midnight UTC (= 5 PM PDT for NA).
 """
 
-import sys, os, re, time, json, subprocess, requests, urllib3
-from datetime import datetime, timedelta, timezone
+import sys, os, re, time, json, threading, requests
+from datetime import datetime, timezone
 from pathlib import Path
 
-urllib3.disable_warnings()
+import riot_auth
 
-# Force UTF-8 output so emoji in log lines don't crash on Windows cp1252 consoles
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-# ── Config ──────────────────────────────────────────────────────────────────────
-LOCKFILE        = os.path.expandvars(r"%LOCALAPPDATA%\Riot Games\Riot Client\Config\lockfile")
-RIOT_CLIENT     = r"C:\Riot Games\Riot Client\RiotClientServices.exe"
-REGION          = os.environ.get("RIOT_REGION", "na")
+# ── Config ────────────────────────────────────────────────────────────────────
 DISCORD_TOKEN   = os.environ.get("DISCORD_BOT_TOKEN")
 DISCORD_CHANNEL = os.environ.get("DISCORD_CHANNEL_ID")
-WAIT_MINUTES    = int(os.environ.get("WAIT_MINUTES", "30"))
-RECHECK_HOURS   = int(os.environ.get("RECHECK_HOURS", "3"))
 SCRIPT_DIR      = Path(__file__).parent
-STATE_FILE      = SCRIPT_DIR / "state.json"
 
 VP_CURRENCY  = "85ad13f7-3d1b-5128-9eb2-7cd8ee0b5741"
 ITEM_TYPE_ID = "e7c63390-eda7-46e0-bb7a-a6abdacd2433"
@@ -35,48 +36,56 @@ CLIENT_PLATFORM = (
     "dGZvcm1DaGlwc2V0IjogIlVua25vd24iDQp9"
 )
 
-# Rarity colors lifted directly from SkinPeek (embed.js) — contentTierUuid → color
 RARITY_COLORS = {
-    "12683d76-48d7-84a3-4e09-6985794f0445": 0x5a9fe1,  # Select   — blue
-    "0cebb8be-46d7-c12a-d306-e9907bfc5a25": 0x009984,  # Deluxe   — teal
-    "60bca009-4182-7998-dee7-b8a2558dc369": 0xd1538c,  # Premium  — pink
-    "411e4a55-4e59-7757-41f0-86a53f101bb5": 0xf9d563,  # Ultra    — gold
-    "e046854e-406c-37f4-6607-19a9ba8426fc": 0xf99358,  # Exclusive— orange
+    "12683d76-48d7-84a3-4e09-6985794f0445": 0x5a9fe1,  # Select    — blue
+    "0cebb8be-46d7-c12a-d306-e9907bfc5a25": 0x009984,  # Deluxe    — teal
+    "60bca009-4182-7998-dee7-b8a2558dc369": 0xd1538c,  # Premium   — pink
+    "411e4a55-4e59-7757-41f0-86a53f101bb5": 0xf9d563,  # Ultra     — gold
+    "e046854e-406c-37f4-6607-19a9ba8426fc": 0xf99358,  # Exclusive — orange
 }
 
-_client_version = None  # cached after first fetch
-_skins_cache    = None  # levelUUID → {name, icon, color}
+_client_version = None
+_skins_cache    = None
+_accounts       = {}   # discord_user_id → account dict
+_pending        = {}   # discord_user_id → skin dict (awaiting confirm)
+_last_posted    = {}   # discord_user_id → UTC date string
+_session_cache  = {}   # discord_user_id → {"shop": [...], "nm": [...]}
 
-# ── Logging ──────────────────────────────────────────────────────────────────────
+
+# ── Logging ───────────────────────────────────────────────────────────────────
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
-# ── Discord ─────────────────────────────────────────────────────────────────────
-def d_headers():
+
+# ── Discord ───────────────────────────────────────────────────────────────────
+def _dh():
     return {"Authorization": f"Bot {DISCORD_TOKEN}", "Content-Type": "application/json"}
 
-def d_send(content="", embeds=None, embed=None):
-    """Send a message. Pass embeds=[] for multiple, or embed={} for one."""
-    if embed and not embeds:
-        embeds = [embed]
+def d_send(content="", embeds=None):
     payload = {"embeds": embeds} if embeds else {"content": content}
     r = requests.post(f"{DISCORD_API}/channels/{DISCORD_CHANNEL}/messages",
-                      headers=d_headers(), json=payload)
-    r.raise_for_status()
-    return r.json()["id"]
+                      headers=_dh(), json=payload)
+    if r.status_code not in (200, 201):
+        log(f"Discord error {r.status_code}: {r.text[:200]}")
+        return None
+    return r.json().get("id")
 
-def d_messages(after_id, limit=50):
+def d_messages(after_id=None, limit=50):
+    params = {"limit": limit}
+    if after_id:
+        params["after"] = after_id
     r = requests.get(f"{DISCORD_API}/channels/{DISCORD_CHANNEL}/messages",
-                     headers=d_headers(), params={"after": after_id, "limit": limit})
+                     headers=_dh(), params=params)
     if r.status_code == 200:
         data = r.json()
         return data if isinstance(data, list) else []
     return []
 
 def d_bot_id():
-    return requests.get(f"{DISCORD_API}/users/@me", headers=d_headers()).json()["id"]
+    return requests.get(f"{DISCORD_API}/users/@me", headers=_dh()).json()["id"]
 
-# ── Valorant ────────────────────────────────────────────────────────────────────
+
+# ── Valorant API ──────────────────────────────────────────────────────────────
 def get_client_version():
     global _client_version
     if not _client_version:
@@ -84,17 +93,13 @@ def get_client_version():
             requests.get("https://valorant-api.com/v1/version", timeout=10)
             .json()["data"]["riotClientVersion"]
         )
-        log(f"Client version: {_client_version}")
     return _client_version
 
 def build_skins_cache():
-    """Fetch all skins once from valorant-api.com and build a lookup by level UUID.
-    This lets us get skin name, icon, and rarity color without one call per skin.
-    """
     global _skins_cache
     if _skins_cache is not None:
         return _skins_cache
-    log("Building skins cache from valorant-api.com...")
+    log("Building skins cache...")
     r = requests.get("https://valorant-api.com/v1/weapons/skins?language=en-US", timeout=20)
     r.raise_for_status()
     _skins_cache = {}
@@ -105,73 +110,8 @@ def build_skins_cache():
         for level in skin.get("levels", []):
             icon = level.get("displayIcon") or (skin["levels"][0].get("displayIcon") if skin["levels"] else None)
             _skins_cache[level["uuid"]] = {"name": name, "icon": icon, "color": color}
-    log(f"Skins cache built ({len(_skins_cache)} levels indexed)")
+    log(f"Skins cache ready ({len(_skins_cache)} levels)")
     return _skins_cache
-
-def get_tokens():
-    try:
-        with open(LOCKFILE) as f:
-            parts = f.read().strip().split(":")
-        port, password = parts[2], parts[3]
-        r = requests.get(
-            f"https://127.0.0.1:{port}/entitlements/v1/token",
-            auth=("riot", password), verify=False, timeout=5
-        )
-        if r.status_code == 200 and "accessToken" in r.json():
-            d = r.json()
-            return d["accessToken"], d["token"], d["subject"]
-    except Exception:
-        pass
-    return None
-
-def val_process_running():
-    r = subprocess.run(
-        ["tasklist", "/FI", "IMAGENAME eq VALORANT.exe"],
-        capture_output=True, text=True
-    )
-    return "VALORANT.exe" in r.stdout
-
-def launch_and_wait(timeout=1800):
-    """Launch Valorant and wait up to 30 min for auth tokens.
-    Kills stale crashed process first (Vanguard crashes it on sleep/wake).
-    """
-    killed = subprocess.run(
-        ["taskkill", "/F", "/IM", "VALORANT.exe"],
-        capture_output=True, text=True
-    )
-    if "SUCCESS" in killed.stdout:
-        log("Killed stale VALORANT.exe (crash from previous sleep cycle)")
-
-    log("Launching Valorant via Riot Client...")
-    subprocess.Popen([RIOT_CLIENT, "--launch-product=valorant", "--launch-patchline=live"])
-
-    start      = time.time()
-    fired      = set()
-    milestones = [
-        (120,  "⏳ Still waiting on Valorant to open — may be downloading an update..."),
-        (600,  "⏳ 10 min in. Big patch maybe. Still going."),
-        (1200, "⏳ 20 min in. Giving up at 30 min if nothing happens."),
-    ]
-
-    while time.time() - start < timeout:
-        t = get_tokens()
-        if t:
-            log(f"Valorant auth tokens acquired ({int(time.time() - start)}s elapsed)")
-            return t
-        elapsed = time.time() - start
-        for secs, msg in milestones:
-            if elapsed >= secs and secs not in fired:
-                fired.add(secs)
-                status = "VALORANT.exe is running but not ready" if val_process_running() else "game process not visible yet"
-                log(f"Milestone {int(secs/60)} min: {status}")
-                d_send(f"{msg}\n`{status}`")
-        time.sleep(5)
-
-    log("ERROR: Valorant did not launch within 30 min")
-    d_send(f"❌ Valorant didn't launch in 30 min. Going to sleep — retrying in {RECHECK_HOURS}h.")
-    schedule_recheck()
-    sleep_pc(30)
-    return None
 
 def _vh(at, et):
     return {
@@ -182,160 +122,161 @@ def _vh(at, et):
         "Content-Type":            "application/json",
     }
 
-def get_shop(at, et, puuid):
-    """Returns (list of skin dicts, seconds_until_reset).
-    Each skin dict has: name, vp, offer_id, icon, color.
-    """
-    log("Fetching shop from Riot API...")
+def fetch_storefront(at, et, puuid, region):
     r = requests.post(
-        f"https://pd.{REGION}.a.pvp.net/store/v3/storefront/{puuid}",
-        headers=_vh(at, et), json={}, timeout=15
+        f"https://pd.{region}.a.pvp.net/store/v3/storefront/{puuid}",
+        headers=_vh(at, et), json={}, timeout=15,
     )
     r.raise_for_status()
-    panel     = r.json()["SkinsPanelLayout"]
-    remaining = panel["SingleItemOffersRemainingDurationInSeconds"]
+    return r.json()
 
+def parse_shop(storefront) -> tuple:
+    """Returns (skins_list, seconds_until_reset)."""
     cache = build_skins_cache()
+    panel = storefront["SkinsPanelLayout"]
     skins = []
     for offer in panel["SingleItemStoreOffers"]:
-        oid       = offer["OfferID"]
-        vp        = offer["Cost"].get(VP_CURRENCY, 0)
-        skin_data = cache.get(oid, {})
-        name      = skin_data.get("name", oid)
-        icon      = skin_data.get("icon")
-        color     = skin_data.get("color", 0xFF4655)
-        skins.append({"name": name, "vp": vp, "offer_id": oid, "icon": icon, "color": color})
-        log(f"  Skin: {name} ({vp} VP)")
+        oid = offer["OfferID"]
+        sd  = cache.get(oid, {})
+        skins.append({
+            "name":     sd.get("name", oid),
+            "vp":       offer["Cost"].get(VP_CURRENCY, 0),
+            "offer_id": oid,
+            "icon":     sd.get("icon"),
+            "color":    sd.get("color", 0xFF4655),
+            "is_nm":    False,
+        })
+    return skins, panel["SingleItemOffersRemainingDurationInSeconds"]
 
-    log(f"Shop fetched — resets in {fmt_time(remaining)}")
-    return skins, remaining
+def parse_nm(storefront) -> tuple:
+    """Returns (skins_list, seconds_until_end) or (None, None) if NM inactive."""
+    bs     = storefront.get("BonusStore", {})
+    offers = bs.get("BonusStoreOffers")
+    if not offers:
+        return None, None
+    cache = build_skins_cache()
+    skins = []
+    for offer in offers:
+        oid   = offer["Offer"]["OfferID"]   # skin level UUID — for cache lookup only
+        b_oid = offer["BonusOfferID"]        # MUST use this for NM purchases (not OfferID)
+        sd    = cache.get(oid, {})
+        skins.append({
+            "name":     sd.get("name", oid),
+            "vp":       offer["DiscountCosts"].get(VP_CURRENCY, 0),
+            "orig_vp":  offer["Offer"]["Cost"].get(VP_CURRENCY, 0),
+            "disc_pct": offer.get("DiscountPercent", 0),
+            "offer_id": b_oid,
+            "icon":     sd.get("icon"),
+            "color":    sd.get("color", 0xFF4655),
+            "is_nm":    True,
+        })
+    return skins, bs.get("BonusStoreRemainingDurationInSeconds", 0)
 
-def get_vp(at, et, puuid):
-    r       = requests.get(f"https://pd.{REGION}.a.pvp.net/store/v1/wallet/{puuid}",
-                           headers=_vh(at, et), timeout=10)
-    balance = r.json()["Balances"].get(VP_CURRENCY, 0)
-    log(f"VP balance: {balance}")
-    return balance
+def get_vp(at, et, puuid, region) -> int:
+    r = requests.get(f"https://pd.{region}.a.pvp.net/store/v1/wallet/{puuid}",
+                     headers=_vh(at, et), timeout=10)
+    return r.json()["Balances"].get(VP_CURRENCY, 0)
 
-def buy_skin(at, et, offer_id):
-    log(f"Sending purchase request — offer ID: {offer_id}")
+def do_order(at, et, puuid, region, offer_id) -> tuple:
     r = requests.post(
-        f"https://pd.{REGION}.a.pvp.net/store/v1/order/",
+        f"https://pd.{region}.a.pvp.net/store/v1/order/",
         headers=_vh(at, et),
         json={"OfferId": offer_id, "ItemTypeId": ITEM_TYPE_ID, "Quantity": 1},
-        timeout=15
+        timeout=15,
     )
-    log(f"Purchase response: HTTP {r.status_code}")
     return r.status_code == 200, r.text
 
-# ── State ────────────────────────────────────────────────────────────────────────
-def load_state():
+
+# ── Account helpers ───────────────────────────────────────────────────────────
+def load_all_accounts():
+    global _accounts
+    raw = riot_auth.load_accounts()
+    for did, acct in raw.items():
+        try:
+            at, et, puuid, updated = riot_auth.get_tokens(acct)
+            _accounts[did] = updated
+            log(f"Account ready: Discord {did[:10]}... (puuid {puuid[:8]}...)")
+        except Exception as e:
+            log(f"WARNING: Could not refresh account {did}: {e}")
+
+def get_tokens_for(discord_id):
+    """Returns (at, et, account). Refreshes tokens and saves updated cookies."""
+    acct = _accounts.get(discord_id)
+    if not acct:
+        return None, None, None
     try:
-        return json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
-    except Exception:
-        return {}
+        at, et, puuid, updated = riot_auth.get_tokens(acct)
+        _accounts[discord_id] = updated
+        all_accts = riot_auth.load_accounts()
+        all_accts[discord_id] = updated
+        riot_auth.save_accounts(all_accts)
+        return at, et, updated
+    except ValueError as e:
+        log(f"Auth expired for {discord_id}: {e}")
+        d_send(content=f"<@{discord_id}> ⚠️ Your auth expired — ask the admin to re-run `setup_account.py`.")
+        return None, None, None
 
-def save_state(s):
-    STATE_FILE.write_text(json.dumps(s, indent=2))
 
-def clear_state():
-    STATE_FILE.unlink(missing_ok=True)
-
-def shop_day():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-# ── Power / scheduling ───────────────────────────────────────────────────────────
-def schedule_recheck(hours=None):
-    """Register a one-time WakeToRun task via PowerShell.
-    schtasks /Create has no WakeToRun flag — must use PowerShell.
-    """
-    if hours is None:
-        hours = RECHECK_HOURS
-    wake   = datetime.now() + timedelta(hours=hours)
-    script = str(SCRIPT_DIR / "run.ps1").replace("'", "''")
-    ps_cmd = (
-        f"$a = New-ScheduledTaskAction -Execute 'powershell.exe' "
-        f"  -Argument '-NonInteractive -ExecutionPolicy Bypass -File \"{script}\"'; "
-        f"$t = New-ScheduledTaskTrigger -Once -At '{wake.strftime('%H:%M')}'; "
-        f"$s = New-ScheduledTaskSettingsSet -WakeToRun "
-        f"  -ExecutionTimeLimit (New-TimeSpan -Hours 2) "
-        f"  -MultipleInstances IgnoreNew; "
-        f"$p = New-ScheduledTaskPrincipal -UserId $env:USERNAME "
-        f"  -LogonType S4U -RunLevel Highest; "
-        f"Register-ScheduledTask -TaskName 'ValorantShopBotRecheck' "
-        f"  -Action $a -Trigger $t -Settings $s -Principal $p -Force | Out-Null; "
-        f"Write-Output 'OK'"
-    )
-    r = subprocess.run(["powershell", "-NonInteractive", "-Command", ps_cmd],
-                       capture_output=True, text=True)
-    if "OK" in r.stdout:
-        log(f"Recheck task scheduled for {wake.strftime('%H:%M')} (WakeToRun=True)")
-    else:
-        log(f"WARNING: recheck task may not have registered")
-        log(f"  stdout: {r.stdout.strip()}")
-        log(f"  stderr: {r.stderr.strip()}")
-
-def delete_recheck_task():
-    subprocess.run(
-        ["powershell", "-NonInteractive", "-Command",
-         "Unregister-ScheduledTask -TaskName 'ValorantShopBotRecheck' "
-         "-Confirm:$false -ErrorAction SilentlyContinue"],
-        capture_output=True
-    )
-    log("Deleted stale recheck task (if any)")
-
-def sleep_pc(delay=10):
-    """Suspend to RAM (S3). WakeToRun tasks can wake it back up.
-    IMPORTANT: do NOT change to 'shutdown /s' — a powered-off PC cannot be
-    woken by Task Scheduler, breaking the entire recheck system.
-    sys.exit(0) fires after wake so this stale process doesn't clash with
-    the new one Task Scheduler starts.
-    """
-    log(f"Sleeping in {delay}s — recheck scheduled")
-    if delay > 0:
-        time.sleep(delay)
-    subprocess.run(["rundll32", "powrprof.dll,SetSuspendState", "0,1,0"])
-    log("Resumed from sleep — exiting stale process")
-    sys.exit(0)
-
-# ── Embed builders ───────────────────────────────────────────────────────────────
+# ── Embed builders ────────────────────────────────────────────────────────────
 def fmt_time(secs):
     h, r = divmod(max(0, int(secs)), 3600)
     return f"{h}h {r // 60}m" if h else f"{r // 60}m"
 
-def shop_embeds(skins, remaining, vp, is_recheck):
-    """Returns a list of embed dicts: one dark header + one per skin (SkinPeek style).
-    Each skin embed gets its rarity color as the left border and the skin icon as thumbnail.
-    """
-    title = "🔫 Valorant Daily Shop" if not is_recheck else "🔫 Shop Reminder"
+def shop_embeds(skins, remaining, vp, mention=None):
+    who = f"<@{mention}>'s " if mention else ""
     header = {
         "description": (
-            f"**{title}**\n"
+            f"**🔫 {who}Daily Shop**\n"
             f"⏱ Resets in **{fmt_time(remaining)}**  ·  💰 **{vp} VP**\n\n"
-            f"`buy <name or #>` to purchase  ·  `no` to skip"
+            f"`buy <name or #>` to purchase  ·  `nm` for night market"
         ),
         "color": 0x202225,
     }
     embeds = [header]
-    for i, skin in enumerate(skins):
+    for i, s in enumerate(skins):
+        e = {"title": f"`{i+1}.`  {s['name']}", "description": f"**{s['vp']} VP**",
+             "color": s["color"]}
+        if s.get("icon"):
+            e["thumbnail"] = {"url": s["icon"]}
+        embeds.append(e)
+    return embeds
+
+def nm_embeds(skins, remaining, vp, mention=None):
+    who = f"<@{mention}>'s " if mention else ""
+    if not skins:
+        return [{"description": f"🌙 {who}Night Market isn't active right now.", "color": 0x202225}]
+    header = {
+        "description": (
+            f"**🌙 {who}Night Market**\n"
+            f"⏱ Ends in **{fmt_time(remaining)}**  ·  💰 **{vp} VP**\n\n"
+            f"`buy nm1` / `buy <name>` to purchase at the discounted price"
+        ),
+        "color": 0x202225,
+    }
+    embeds = [header]
+    for i, s in enumerate(skins):
         e = {
-            "title": f"`{i+1}.`  {skin['name']}",
-            "description": f"**{skin['vp']} VP**",
-            "color": skin["color"],
+            "title":       f"`NM{i+1}.`  {s['name']}",
+            "description": f"~~{s['orig_vp']} VP~~ → **{s['vp']} VP**  (-{s['disc_pct']}%)",
+            "color":       s["color"],
         }
-        if skin.get("icon"):
-            e["thumbnail"] = {"url": skin["icon"]}
+        if s.get("icon"):
+            e["thumbnail"] = {"url": s["icon"]}
         embeds.append(e)
     return embeds
 
 def confirm_embed(skin, vp):
-    """Confirmation embed with the skin's rarity color and icon."""
+    if skin.get("is_nm"):
+        price_line = f"~~{skin['orig_vp']} VP~~ → **{skin['vp']} VP** (-{skin['disc_pct']}%)"
+    else:
+        price_line = f"**{skin['vp']} VP**"
     e = {
         "title": "⚠️ Confirm Purchase",
         "description": (
-            f"**{skin['name']}** — {skin['vp']} VP\n"
+            f"**{skin['name']}**\n"
+            f"{price_line}\n"
             f"Balance: **{vp} VP**\n\n"
-            f"`confirm` to buy  ·  `cancel` to go back  ·  `no` to skip"
+            f"`confirm` to buy  ·  `cancel` to abort"
         ),
         "color": skin.get("color", 0xFFA500),
     }
@@ -343,210 +284,204 @@ def confirm_embed(skin, vp):
         e["thumbnail"] = {"url": skin["icon"]}
     return e
 
-def match_skin(q, skins):
-    q = q.strip().lower()
-    if q.isdigit():
-        idx = int(q) - 1
-        return skins[idx] if 0 <= idx < len(skins) else None
-    return next((s for s in skins if q in s["name"].lower()), None)
 
-def do_purchase(at, et, skin):
-    log(f"Executing purchase: {skin['name']} ({skin['vp']} VP)")
+# ── Command handlers ──────────────────────────────────────────────────────────
+def handle_shop(discord_id, auto=False):
+    at, et, acct = get_tokens_for(discord_id)
+    if not acct:
+        if not auto:
+            d_send(content=f"<@{discord_id}> Not set up — ask admin to run `setup_account.py`.")
+        return
+    try:
+        sf               = fetch_storefront(at, et, acct["puuid"], acct["region"])
+        skins, remaining = parse_shop(sf)
+        nm_skins, nm_rem = parse_nm(sf)
+        vp               = get_vp(at, et, acct["puuid"], acct["region"])
+
+        _session_cache[discord_id] = {"shop": skins, "nm": nm_skins}
+        _last_posted[discord_id]   = shop_day()
+
+        mention = discord_id if len(_accounts) > 1 else None
+        d_send(embeds=shop_embeds(skins, remaining, vp, mention))
+
+        if nm_skins:
+            d_send(embeds=nm_embeds(nm_skins, nm_rem, vp, mention))
+
+        log(f"{'Auto-posted' if auto else 'Posted'} shop for {discord_id[:10]}... "
+            f"({'NM active' if nm_skins else 'no NM'})")
+    except Exception as e:
+        log(f"Shop fetch failed for {discord_id}: {e}")
+        if not auto:
+            d_send(content=f"<@{discord_id}> ❌ Failed: `{e}`")
+
+def handle_nm(discord_id):
+    at, et, acct = get_tokens_for(discord_id)
+    if not acct:
+        d_send(content=f"<@{discord_id}> Not set up.")
+        return
+    try:
+        sf               = fetch_storefront(at, et, acct["puuid"], acct["region"])
+        nm_skins, nm_rem = parse_nm(sf)
+        vp               = get_vp(at, et, acct["puuid"], acct["region"])
+
+        cached = _session_cache.setdefault(discord_id, {})
+        cached["nm"] = nm_skins
+
+        mention = discord_id if len(_accounts) > 1 else None
+        d_send(embeds=nm_embeds(nm_skins, nm_rem, vp, mention))
+        log(f"NM posted for {discord_id[:10]}...")
+    except Exception as e:
+        log(f"NM fetch failed for {discord_id}: {e}")
+        d_send(content=f"<@{discord_id}> ❌ Night market failed: `{e}`")
+
+def handle_buy(discord_id, query):
+    cached     = _session_cache.get(discord_id, {})
+    shop_skins = cached.get("shop", [])
+    nm_skins   = cached.get("nm") or []
+
+    if not shop_skins and not nm_skins:
+        d_send(content="Run `shop` first so I know what's in your store.")
+        return
+
+    skin = _match(query, shop_skins) or _match(query, nm_skins)
+    if not skin:
+        d_send(content=f"❌ No match for `{query}` — use `buy 2`, `buy nm3`, or partial name.")
+        return
+
+    at, et, acct = get_tokens_for(discord_id)
+    if not at:
+        return
+    vp = get_vp(at, et, acct["puuid"], acct["region"])
+    _pending[discord_id] = skin
+    d_send(embeds=[confirm_embed(skin, vp)])
+    log(f"Buy pending for {discord_id[:10]}...: {skin['name']} "
+        f"({skin['vp']} VP, nm={skin['is_nm']})")
+
+def handle_confirm(discord_id):
+    skin = _pending.pop(discord_id, None)
+    if not skin:
+        d_send(content="Nothing pending — use `buy <name>` first.")
+        return
+    at, et, acct = get_tokens_for(discord_id)
+    if not at:
+        return
     d_send(content="⏳ Purchasing...")
-    ok, resp = buy_skin(at, et, skin["offer_id"])
+    ok, resp = do_order(at, et, acct["puuid"], acct["region"], skin["offer_id"])
     if ok:
-        log("Purchase successful!")
+        log(f"Purchase OK: {skin['name']} for {discord_id[:10]}...")
+        desc = f"**{skin['name']}** for **{skin['vp']} VP**"
+        if skin.get("is_nm"):
+            desc += f" (-{skin['disc_pct']}%)"
         d_send(embeds=[{
             "title": "✅ Bought!",
-            "description": f"**{skin['name']}** for **{skin['vp']} VP**. Enjoy!\nPC going to sleep.",
+            "description": desc + "  enjoy!",
             "color": skin.get("color", 0x57F287),
             **({"thumbnail": {"url": skin["icon"]}} if skin.get("icon") else {}),
         }])
-        clear_state()
-        sleep_pc(30)
-        return True
     else:
-        log(f"Purchase FAILED — {resp[:300]}")
-        d_send(content=f"❌ Purchase failed: `{resp[:200]}`\nTry `buy <skin>` again or `no` to skip.")
-        return False
+        log(f"Purchase FAILED: {resp[:200]}")
+        d_send(content=f"❌ Purchase failed: `{resp[:200]}`\nTry `buy <skin>` again.")
 
-def go_sleep(state, reason=""):
-    if reason:
-        log(f"Going to sleep — {reason}")
-        d_send(content=f"{reason} Checking again in **{RECHECK_HOURS}h** — going to sleep.")
-    save_state(state)
-    schedule_recheck()
-    sleep_pc(10)
 
-# ── Main ─────────────────────────────────────────────────────────────────────────
+# ── Misc helpers ──────────────────────────────────────────────────────────────
+def shop_day():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def _match(q, skins):
+    """Match by number (1-based), nm-number (nm1...), or partial name."""
+    q = q.strip().lower()
+    idx_str = re.sub(r"^nm", "", q)
+    if idx_str.isdigit():
+        idx = int(idx_str) - 1
+        return skins[idx] if 0 <= idx < len(skins) else None
+    return next((s for s in skins if q in s["name"].lower()), None)
+
+
+# ── Auto-post (midnight UTC = shop reset for all regions) ─────────────────────
+def auto_post_loop():
+    log("Auto-post scheduler running (fires at 00:00 UTC daily)")
+    while True:
+        now   = datetime.now(timezone.utc)
+        today = now.strftime("%Y-%m-%d")
+        if now.hour == 0 and now.minute < 10:
+            for discord_id in list(_accounts.keys()):
+                if _last_posted.get(discord_id) != today:
+                    log(f"Auto-posting for {discord_id[:10]}...")
+                    handle_shop(discord_id, auto=True)
+                    time.sleep(3)
+        time.sleep(60)
+
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
 def main():
     log("=" * 55)
-    log("Valorant Shop Bot starting up")
-    log(f"Region: {REGION}  |  Window: {WAIT_MINUTES} min  |  Recheck: every {RECHECK_HOURS}h")
+    log("Valorant Shop Bot — VPS edition")
     log("=" * 55)
 
-    # ── Startup checks ─────────────────────────────────────────────────────────
     if not DISCORD_TOKEN or not DISCORD_CHANNEL:
-        log("FATAL: DISCORD_BOT_TOKEN and/or DISCORD_CHANNEL_ID env vars are not set.")
-        log("Open run.ps1 and fill in both values.")
-        sys.exit(1)
-
-    if not Path(RIOT_CLIENT).exists():
-        log(f"FATAL: Riot Client not found at: {RIOT_CLIENT}")
-        log("Update the RIOT_CLIENT path in bot.py to match your install location.")
+        log("FATAL: DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID not set.")
         sys.exit(1)
 
     try:
-        bot_id = d_bot_id()
-        log(f"Discord connection OK — bot ID: {bot_id}")
+        BOT_ID = d_bot_id()
+        log(f"Discord OK — bot ID: {BOT_ID}")
     except Exception as e:
-        log(f"FATAL: Could not reach Discord API — {e}")
+        log(f"FATAL: Discord connection failed: {e}")
         sys.exit(1)
 
-    # ── Determine mode ─────────────────────────────────────────────────────────
-    state      = load_state()
-    today      = shop_day()
-    is_recheck = state.get("day") == today
-    log(f"Mode: {'RECHECK — same shop day' if is_recheck else 'FRESH START — new shop day'}")
-
-    # ── Valorant auth ──────────────────────────────────────────────────────────
-    log("Checking for existing Valorant session...")
-    tokens = get_tokens()
-    if tokens:
-        log("Valorant already running — skipping launch")
+    load_all_accounts()
+    if not _accounts:
+        log("WARNING: No accounts. Run: python setup_account.py <discord_user_id> [region]")
     else:
-        log("Valorant not running — launching now")
-        tokens = launch_and_wait()
-    if not tokens:
-        return
-    at, et, puuid = tokens
-    log(f"Authenticated — PUUID: {puuid[:8]}...")
+        log(f"{len(_accounts)} account(s) loaded")
 
-    # ── Fetch shop ─────────────────────────────────────────────────────────────
-    try:
-        skins, remaining = get_shop(at, et, puuid)
-        vp               = get_vp(at, et, puuid)
-    except Exception as e:
-        log(f"ERROR fetching shop: {e}")
-        fresh_state = state if is_recheck else {"day": today}
-        d_send(content=f"❌ Failed to fetch shop: `{e}`\nGoing to sleep — retrying in {RECHECK_HOURS}h.")
-        go_sleep(fresh_state)
-        return
+    build_skins_cache()
 
-    if not is_recheck:
-        delete_recheck_task()
-        state = {"day": today}
+    threading.Thread(target=auto_post_loop, daemon=True).start()
 
-    # ── Scan Discord for commands sent while PC was sleeping (recheck only) ────
-    pending = state.get("pending")
-    last_id = state.get("last_msg_id")
+    # Start from latest message so we don't replay history on startup
+    msgs    = d_messages(limit=1)
+    last_id = msgs[0]["id"] if msgs else "0"
+    log(f"Polling every 5s (after msg {last_id})")
 
-    if last_id and is_recheck:
-        missed = d_messages(last_id)
-        log(f"Scanning {len(missed)} missed message(s)...")
-        for msg in reversed(missed):
-            if msg["author"]["id"] == bot_id:
-                continue
-            content = msg["content"].strip().lower()
-            state["last_msg_id"] = msg["id"]
-            log(f"  Missed: '{content}'")
-
-            if pending:
-                if content == "confirm":
-                    log("Confirm found in missed messages — purchasing now")
-                    if do_purchase(at, et, pending):
-                        return
-                    pending = None
-                    state.pop("pending", None)
-                elif content in ("cancel", "no"):
-                    pending = None
-                    state.pop("pending", None)
-                    if content == "no":
-                        go_sleep(state, "👋 Got it.")
-                        return
-            else:
-                m = re.match(r"^buy\s+(.+)$", content)
-                if m:
-                    skin = match_skin(m.group(1), skins)
-                    if skin:
-                        log(f"Buy request in missed messages: {skin['name']}")
-                        pending = skin
-                        state["pending"] = skin
-                elif content == "no":
-                    go_sleep(state, "👋 Got it.")
-                    return
-
-        save_state(state)
-
-    # ── Post to Discord ────────────────────────────────────────────────────────
-    log("Posting to Discord...")
-    if pending:
-        vp     = get_vp(at, et, puuid)
-        msg_id = d_send(embeds=[confirm_embed(pending, vp)])
-        log(f"Confirmation embed posted (skin: {pending['name']})")
-    else:
-        msg_id = d_send(embeds=shop_embeds(skins, remaining, vp, is_recheck))
-        log(f"Shop embeds posted (msg ID: {msg_id})")
-
-    state["last_msg_id"] = msg_id
-    save_state(state)
-
-    # ── Poll for response ──────────────────────────────────────────────────────
-    deadline = time.time() + WAIT_MINUTES * 60
-    wake_at  = datetime.now() + timedelta(minutes=WAIT_MINUTES)
-    log(f"Polling every 20s until {wake_at:%H:%M} ({WAIT_MINUTES} min window)...")
-
-    while time.time() < deadline:
-        time.sleep(20)
-        msgs = d_messages(state["last_msg_id"])
-        if not msgs:
+    while True:
+        try:
+            msgs = d_messages(after_id=last_id)
+        except Exception as e:
+            log(f"Poll error: {e}")
+            time.sleep(10)
             continue
 
         for msg in reversed(msgs):
-            if msg["author"]["id"] == bot_id:
+            if msg["author"]["id"] == BOT_ID:
                 continue
-            content = msg["content"].strip().lower()
-            state["last_msg_id"] = msg["id"]
-            save_state(state)
-            log(f"Incoming: '{content}'")
+            last_id = msg["id"]
+            author  = msg["author"]["id"]
+            text    = msg["content"].strip()
+            cmd     = text.lower()
+            log(f"[{msg['author'].get('username', author[:8])}] {text[:80]}")
 
-            if pending:
-                if content == "confirm":
-                    if do_purchase(at, et, pending):
-                        return
-                    pending = None
-                    state.pop("pending", None)
-                    save_state(state)
-                elif content == "cancel":
-                    log("Purchase cancelled")
-                    pending = None
-                    state.pop("pending", None)
-                    save_state(state)
-                    d_send(content="❌ Cancelled. Reply `buy <skin>` to pick something else.")
-                elif content == "no":
-                    go_sleep(state, "👋 Got it.")
-                    return
-            else:
-                if content == "no":
-                    go_sleep(state, "👋 Got it.")
-                    return
-                m = re.match(r"^buy\s+(.+)$", content)
-                if m:
-                    skin = match_skin(m.group(1), skins)
-                    if skin:
-                        log(f"Buy request: {skin['name']} ({skin['vp']} VP)")
-                        pending = skin
-                        state["pending"] = skin
-                        vp  = get_vp(at, et, puuid)
-                        cid = d_send(embeds=[confirm_embed(skin, vp)])
-                        state["last_msg_id"] = cid
-                        save_state(state)
-                    else:
-                        log(f"No match for '{m.group(1)}'")
-                        d_send(content=f"❌ Couldn't find `{m.group(1)}` in today's shop.")
+            if author not in _accounts:
+                continue   # ignore users who aren't configured
 
-    log(f"No response in {WAIT_MINUTES} min — going to sleep")
-    go_sleep(state, f"⏰ No response in {WAIT_MINUTES} min.")
+            if cmd in ("shop", "s", "daily"):
+                handle_shop(author)
+
+            elif cmd in ("nm", "nightmarket", "night market", "night_market"):
+                handle_nm(author)
+
+            elif re.match(r"^buy\s+\S", cmd):
+                handle_buy(author, re.match(r"^buy\s+(.+)$", cmd).group(1))
+
+            elif cmd == "confirm":
+                if author in _pending:
+                    handle_confirm(author)
+
+            elif cmd == "cancel":
+                if _pending.pop(author, None):
+                    d_send(content="❌ Purchase cancelled.")
+
+        time.sleep(5)
 
 
 if __name__ == "__main__":
