@@ -29,6 +29,8 @@ def _pkce():
 
 def _exchange_code(code: str, verifier: str):
     """Exchange authorization code → (access_token, refresh_token)."""
+    # code may arrive URL-encoded from the browser — decode it first
+    code = urllib.parse.unquote(code)
     r = requests.post(
         f"{AUTH_BASE}/token",
         data={
@@ -36,9 +38,9 @@ def _exchange_code(code: str, verifier: str):
             "code":          code,
             "redirect_uri":  "http://localhost/redirect",
             "code_verifier": verifier,
+            "client_id":     "riot-client",
         },
         headers={**_HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
-        auth=("riot-client", ""),
         timeout=15,
     )
     if not r.ok:
@@ -130,9 +132,8 @@ def refresh(account: dict) -> dict:
 
     r = requests.post(
         f"{AUTH_BASE}/token",
-        data={"grant_type": "refresh_token", "refresh_token": rt},
+        data={"grant_type": "refresh_token", "refresh_token": rt, "client_id": "riot-client"},
         headers={**_HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
-        auth=("riot-client", ""),
         timeout=15,
     )
     if not r.ok:
