@@ -295,7 +295,12 @@ class BuyView(discord.ui.View):
 
 
 # ── Slash commands ────────────────────────────────────────────────────────────
+_user_install   = app_commands.allowed_installs(guilds=True, users=True)
+_all_contexts   = app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+
 @tree.command(name="shop", description="See your daily Valorant shop")
+@_user_install
+@_all_contexts
 async def cmd_shop(interaction: discord.Interaction):
     uid = str(interaction.user.id)
     if uid not in _accounts:
@@ -326,6 +331,8 @@ async def cmd_shop(interaction: discord.Interaction):
 
 
 @tree.command(name="nm", description="See your Valorant night market")
+@_user_install
+@_all_contexts
 async def cmd_nm(interaction: discord.Interaction):
     uid = str(interaction.user.id)
     if uid not in _accounts:
@@ -348,6 +355,8 @@ async def cmd_nm(interaction: discord.Interaction):
 
 
 @tree.command(name="buy", description="Buy a skin from your shop or night market")
+@_user_install
+@_all_contexts
 @app_commands.describe(skin="Skin name or number (e.g. 'phantom', '2', 'nm3')")
 async def cmd_buy(interaction: discord.Interaction, skin: str):
     uid    = str(interaction.user.id)
@@ -383,6 +392,8 @@ async def cmd_buy(interaction: discord.Interaction, skin: str):
 
 
 @tree.command(name="setup", description="Link your Riot/Valorant account")
+@_user_install
+@_all_contexts
 @app_commands.describe(region="Your Valorant region (default: na)")
 @app_commands.choices(region=[
     app_commands.Choice(name="NA", value="na"),
