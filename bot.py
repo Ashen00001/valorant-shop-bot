@@ -35,7 +35,17 @@ CLIENT_PLATFORM = (
     "dGZvcm1DaGlwc2V0IjogIlVua25vd24iDQp9"
 )
 
+# Rarity colors lifted directly from SkinPeek (embed.js) — contentTierUuid → color
+RARITY_COLORS = {
+    "12683d76-48d7-84a3-4e09-6985794f0445": 0x5a9fe1,  # Select   — blue
+    "0cebb8be-46d7-c12a-d306-e9907bfc5a25": 0x009984,  # Deluxe   — teal
+    "60bca009-4182-7998-dee7-b8a2558dc369": 0xd1538c,  # Premium  — pink
+    "411e4a55-4e59-7757-41f0-86a53f101bb5": 0xf9d563,  # Ultra    — gold
+    "e046854e-406c-37f4-6607-19a9ba8426fc": 0xf99358,  # Exclusive— orange
+}
+
 _client_version = None  # cached after first fetch
+_skins_cache    = None  # levelUUID → {name, icon, color}
 
 # ── Logging ──────────────────────────────────────────────────────────────────────
 def log(msg):
@@ -45,8 +55,11 @@ def log(msg):
 def d_headers():
     return {"Authorization": f"Bot {DISCORD_TOKEN}", "Content-Type": "application/json"}
 
-def d_send(content="", embed=None):
-    payload = {"embeds": [embed]} if embed else {"content": content}
+def d_send(content="", embeds=None, embed=None):
+    """Send a message. Pass embeds=[] for multiple, or embed={} for one."""
+    if embed and not embeds:
+        embeds = [embed]
+    payload = {"embeds": embeds} if embeds else {"content": content}
     r = requests.post(f"{DISCORD_API}/channels/{DISCORD_CHANNEL}/messages",
                       headers=d_headers(), json=payload)
     r.raise_for_status()
@@ -57,7 +70,6 @@ def d_messages(after_id, limit=50):
                      headers=d_headers(), params={"after": after_id, "limit": limit})
     if r.status_code == 200:
         data = r.json()
-        # API returns a list on success; an error dict if something's wrong
         return data if isinstance(data, list) else []
     return []
 
@@ -66,7 +78,6 @@ def d_bot_id():
 
 # ── Valorant ────────────────────────────────────────────────────────────────────
 def get_client_version():
-    """Fetched once and cached — don't hit valorant-api.com on every request."""
     global _client_version
     if not _client_version:
         _client_version = (
@@ -76,10 +87,28 @@ def get_client_version():
         log(f"Client version: {_client_version}")
     return _client_version
 
-def get_tokens():
-    """Read Riot Client lockfile and return (access_token, entitlements_token, puuid).
-    Returns None if Valorant isn't running yet — lockfile exists but game isn't up.
+def build_skins_cache():
+    """Fetch all skins once from valorant-api.com and build a lookup by level UUID.
+    This lets us get skin name, icon, and rarity color without one call per skin.
     """
+    global _skins_cache
+    if _skins_cache is not None:
+        return _skins_cache
+    log("Building skins cache from valorant-api.com...")
+    r = requests.get("https://valorant-api.com/v1/weapons/skins?language=en-US", timeout=20)
+    r.raise_for_status()
+    _skins_cache = {}
+    for skin in r.json()["data"]:
+        name  = skin["displayName"]
+        tier  = skin.get("contentTierUuid", "")
+        color = RARITY_COLORS.get(tier, 0xFF4655)
+        for level in skin.get("levels", []):
+            icon = level.get("displayIcon") or (skin["levels"][0].get("displayIcon") if skin["levels"] else None)
+            _skins_cache[level["uuid"]] = {"name": name, "icon": icon, "color": color}
+    log(f"Skins cache built ({len(_skins_cache)} levels indexed)")
+    return _skins_cache
+
+def get_tokens():
     try:
         with open(LOCKFILE) as f:
             parts = f.read().strip().split(":")
@@ -96,7 +125,6 @@ def get_tokens():
     return None
 
 def val_process_running():
-    """True if VALORANT.exe is in the process list (game is up, not just launcher)."""
     r = subprocess.run(
         ["tasklist", "/FI", "IMAGENAME eq VALORANT.exe"],
         capture_output=True, text=True
@@ -104,12 +132,9 @@ def val_process_running():
     return "VALORANT.exe" in r.stdout
 
 def launch_and_wait(timeout=1800):
-    """Launch Valorant and wait up to 30 min for auth tokens to be available.
-    Posts Discord milestones so you can see what's happening from your phone.
+    """Launch Valorant and wait up to 30 min for auth tokens.
+    Kills stale crashed process first (Vanguard crashes it on sleep/wake).
     """
-    # Kill any stale/crashed Valorant process before launching fresh.
-    # Vanguard anti-cheat crashes the game on sleep/wake cycles, which leaves
-    # a dead process that would block a clean relaunch.
     killed = subprocess.run(
         ["taskkill", "/F", "/IM", "VALORANT.exe"],
         capture_output=True, text=True
@@ -133,40 +158,34 @@ def launch_and_wait(timeout=1800):
         if t:
             log(f"Valorant auth tokens acquired ({int(time.time() - start)}s elapsed)")
             return t
-
         elapsed = time.time() - start
         for secs, msg in milestones:
             if elapsed >= secs and secs not in fired:
                 fired.add(secs)
-                running = val_process_running()
-                status  = "VALORANT.exe is running but not ready" if running else "game process not visible yet"
+                status = "VALORANT.exe is running but not ready" if val_process_running() else "game process not visible yet"
                 log(f"Milestone {int(secs/60)} min: {status}")
                 d_send(f"{msg}\n`{status}`")
-
         time.sleep(5)
 
-    # 30-min timeout — schedule recheck and sleep
     log("ERROR: Valorant did not launch within 30 min")
-    d_send(
-        f"❌ Valorant didn't launch in 30 min (stuck update?). "
-        f"Going to sleep — will try again in {RECHECK_HOURS}h."
-    )
+    d_send(f"❌ Valorant didn't launch in 30 min. Going to sleep — retrying in {RECHECK_HOURS}h.")
     schedule_recheck()
     sleep_pc(30)
-    return None  # unreachable — sleep_pc exits the process on wake
+    return None
 
 def _vh(at, et):
-    """Build Valorant API headers (client version is cached)."""
     return {
-        "Authorization":          f"Bearer {at}",
-        "X-Riot-Entitlements-JWT": et,
-        "X-Riot-ClientPlatform":   CLIENT_PLATFORM,
-        "X-Riot-ClientVersion":    get_client_version(),
-        "Content-Type":           "application/json",
+        "Authorization":           f"Bearer {at}",
+        "X-Riot-Entitlements-JWT":  et,
+        "X-Riot-ClientPlatform":    CLIENT_PLATFORM,
+        "X-Riot-ClientVersion":     get_client_version(),
+        "Content-Type":            "application/json",
     }
 
 def get_shop(at, et, puuid):
-    """Returns (list of skin dicts, seconds_until_reset)."""
+    """Returns (list of skin dicts, seconds_until_reset).
+    Each skin dict has: name, vp, offer_id, icon, color.
+    """
     log("Fetching shop from Riot API...")
     r = requests.post(
         f"https://pd.{REGION}.a.pvp.net/store/v3/storefront/{puuid}",
@@ -175,15 +194,20 @@ def get_shop(at, et, puuid):
     r.raise_for_status()
     panel     = r.json()["SkinsPanelLayout"]
     remaining = panel["SingleItemOffersRemainingDurationInSeconds"]
+
+    cache = build_skins_cache()
     skins = []
     for offer in panel["SingleItemStoreOffers"]:
-        oid  = offer["OfferID"]
-        vp   = offer["Cost"].get(VP_CURRENCY, 0)
-        sr   = requests.get(f"https://valorant-api.com/v1/weapons/skinlevels/{oid}", timeout=5)
-        name = sr.json()["data"]["displayName"] if sr.status_code == 200 else oid
-        skins.append({"name": name, "vp": vp, "offer_id": oid})
+        oid       = offer["OfferID"]
+        vp        = offer["Cost"].get(VP_CURRENCY, 0)
+        skin_data = cache.get(oid, {})
+        name      = skin_data.get("name", oid)
+        icon      = skin_data.get("icon")
+        color     = skin_data.get("color", 0xFF4655)
+        skins.append({"name": name, "vp": vp, "offer_id": oid, "icon": icon, "color": color})
         log(f"  Skin: {name} ({vp} VP)")
-    log(f"Shop fetch complete — resets in {fmt_time(remaining)}")
+
+    log(f"Shop fetched — resets in {fmt_time(remaining)}")
     return skins, remaining
 
 def get_vp(at, et, puuid):
@@ -218,20 +242,17 @@ def clear_state():
     STATE_FILE.unlink(missing_ok=True)
 
 def shop_day():
-    """UTC date string — Valorant shop resets at midnight UTC."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 # ── Power / scheduling ───────────────────────────────────────────────────────────
 def schedule_recheck(hours=None):
-    """Register a one-time Task Scheduler task to wake the PC and recheck.
-    Uses PowerShell (not schtasks) because schtasks has no WakeToRun flag.
-    Without WakeToRun the PC won't actually wake up — it would just sit there asleep.
+    """Register a one-time WakeToRun task via PowerShell.
+    schtasks /Create has no WakeToRun flag — must use PowerShell.
     """
     if hours is None:
         hours = RECHECK_HOURS
     wake   = datetime.now() + timedelta(hours=hours)
-    script = str(SCRIPT_DIR / "run.ps1").replace("'", "''")  # escape single quotes
-
+    script = str(SCRIPT_DIR / "run.ps1").replace("'", "''")
     ps_cmd = (
         f"$a = New-ScheduledTaskAction -Execute 'powershell.exe' "
         f"  -Argument '-NonInteractive -ExecutionPolicy Bypass -File \"{script}\"'; "
@@ -245,14 +266,12 @@ def schedule_recheck(hours=None):
         f"  -Action $a -Trigger $t -Settings $s -Principal $p -Force | Out-Null; "
         f"Write-Output 'OK'"
     )
-    r = subprocess.run(
-        ["powershell", "-NonInteractive", "-Command", ps_cmd],
-        capture_output=True, text=True
-    )
+    r = subprocess.run(["powershell", "-NonInteractive", "-Command", ps_cmd],
+                       capture_output=True, text=True)
     if "OK" in r.stdout:
         log(f"Recheck task scheduled for {wake.strftime('%H:%M')} (WakeToRun=True)")
     else:
-        log(f"WARNING: recheck task may not have registered correctly")
+        log(f"WARNING: recheck task may not have registered")
         log(f"  stdout: {r.stdout.strip()}")
         log(f"  stderr: {r.stderr.strip()}")
 
@@ -266,31 +285,63 @@ def delete_recheck_task():
     log("Deleted stale recheck task (if any)")
 
 def sleep_pc(delay=10):
-    """Suspend to RAM (S3 sleep). WakeToRun tasks can wake the PC back up.
-
-    IMPORTANT — do NOT change this to 'shutdown /s':
-      A powered-off PC cannot be woken by Task Scheduler.
-      Sleep (S3) is what lets the BIOS timer fire and wake the machine.
-
-    After the PC wakes up from this sleep call, sys.exit(0) fires immediately.
-    This prevents the old bot process from running alongside the new one that
-    Task Scheduler starts on wake.
+    """Suspend to RAM (S3). WakeToRun tasks can wake it back up.
+    IMPORTANT: do NOT change to 'shutdown /s' — a powered-off PC cannot be
+    woken by Task Scheduler, breaking the entire recheck system.
+    sys.exit(0) fires after wake so this stale process doesn't clash with
+    the new one Task Scheduler starts.
     """
-    log(f"Sleeping in {delay}s — PC will wake for recheck as scheduled")
+    log(f"Sleeping in {delay}s — recheck scheduled")
     if delay > 0:
         time.sleep(delay)
     subprocess.run(["rundll32", "powrprof.dll,SetSuspendState", "0,1,0"])
-    # PC just woke back up — exit so we don't collide with the new scheduled instance
     log("Resumed from sleep — exiting stale process")
     sys.exit(0)
 
-# ── Helpers ──────────────────────────────────────────────────────────────────────
+# ── Embed builders ───────────────────────────────────────────────────────────────
 def fmt_time(secs):
     h, r = divmod(max(0, int(secs)), 3600)
     return f"{h}h {r // 60}m" if h else f"{r // 60}m"
 
-def skin_list(skins):
-    return "\n".join(f"`{i+1}.` **{s['name']}** — {s['vp']} VP" for i, s in enumerate(skins))
+def shop_embeds(skins, remaining, vp, is_recheck):
+    """Returns a list of embed dicts: one dark header + one per skin (SkinPeek style).
+    Each skin embed gets its rarity color as the left border and the skin icon as thumbnail.
+    """
+    title = "🔫 Valorant Daily Shop" if not is_recheck else "🔫 Shop Reminder"
+    header = {
+        "description": (
+            f"**{title}**\n"
+            f"⏱ Resets in **{fmt_time(remaining)}**  ·  💰 **{vp} VP**\n\n"
+            f"`buy <name or #>` to purchase  ·  `no` to skip"
+        ),
+        "color": 0x202225,
+    }
+    embeds = [header]
+    for i, skin in enumerate(skins):
+        e = {
+            "title": f"`{i+1}.`  {skin['name']}",
+            "description": f"**{skin['vp']} VP**",
+            "color": skin["color"],
+        }
+        if skin.get("icon"):
+            e["thumbnail"] = {"url": skin["icon"]}
+        embeds.append(e)
+    return embeds
+
+def confirm_embed(skin, vp):
+    """Confirmation embed with the skin's rarity color and icon."""
+    e = {
+        "title": "⚠️ Confirm Purchase",
+        "description": (
+            f"**{skin['name']}** — {skin['vp']} VP\n"
+            f"Balance: **{vp} VP**\n\n"
+            f"`confirm` to buy  ·  `cancel` to go back  ·  `no` to skip"
+        ),
+        "color": skin.get("color", 0xFFA500),
+    }
+    if skin.get("icon"):
+        e["thumbnail"] = {"url": skin["icon"]}
+    return e
 
 def match_skin(q, skins):
     q = q.strip().lower()
@@ -301,31 +352,28 @@ def match_skin(q, skins):
 
 def do_purchase(at, et, skin):
     log(f"Executing purchase: {skin['name']} ({skin['vp']} VP)")
-    d_send("⏳ Purchasing...")
+    d_send(content="⏳ Purchasing...")
     ok, resp = buy_skin(at, et, skin["offer_id"])
     if ok:
         log("Purchase successful!")
-        d_send(embed={
+        d_send(embeds=[{
             "title": "✅ Bought!",
-            "description": (
-                f"**{skin['name']}** for **{skin['vp']} VP**. Enjoy!\n"
-                f"PC going to sleep."
-            ),
-            "color": 0x57F287,
-        })
+            "description": f"**{skin['name']}** for **{skin['vp']} VP**. Enjoy!\nPC going to sleep.",
+            "color": skin.get("color", 0x57F287),
+            **({"thumbnail": {"url": skin["icon"]}} if skin.get("icon") else {}),
+        }])
         clear_state()
         sleep_pc(30)
         return True
     else:
-        log(f"Purchase FAILED — response: {resp[:300]}")
-        d_send(f"❌ Purchase failed: `{resp[:200]}`\nTry `buy <skin>` again or `no` to skip.")
+        log(f"Purchase FAILED — {resp[:300]}")
+        d_send(content=f"❌ Purchase failed: `{resp[:200]}`\nTry `buy <skin>` again or `no` to skip.")
         return False
 
 def go_sleep(state, reason=""):
-    """Schedule the next recheck, post to Discord, then sleep."""
     if reason:
         log(f"Going to sleep — {reason}")
-        d_send(f"{reason} Checking again in **{RECHECK_HOURS}h** — going to sleep.")
+        d_send(content=f"{reason} Checking again in **{RECHECK_HOURS}h** — going to sleep.")
     save_state(state)
     schedule_recheck()
     sleep_pc(10)
@@ -345,7 +393,7 @@ def main():
 
     if not Path(RIOT_CLIENT).exists():
         log(f"FATAL: Riot Client not found at: {RIOT_CLIENT}")
-        log("Update the RIOT_CLIENT path in bot.py to match where Riot Games is installed.")
+        log("Update the RIOT_CLIENT path in bot.py to match your install location.")
         sys.exit(1)
 
     try:
@@ -353,14 +401,13 @@ def main():
         log(f"Discord connection OK — bot ID: {bot_id}")
     except Exception as e:
         log(f"FATAL: Could not reach Discord API — {e}")
-        log("Check that DISCORD_BOT_TOKEN in run.ps1 is correct.")
         sys.exit(1)
 
     # ── Determine mode ─────────────────────────────────────────────────────────
     state      = load_state()
     today      = shop_day()
     is_recheck = state.get("day") == today
-    log(f"Mode: {'RECHECK — same shop day, scanning for missed commands' if is_recheck else 'FRESH START — new shop day'}")
+    log(f"Mode: {'RECHECK — same shop day' if is_recheck else 'FRESH START — new shop day'}")
 
     # ── Valorant auth ──────────────────────────────────────────────────────────
     log("Checking for existing Valorant session...")
@@ -371,7 +418,6 @@ def main():
         log("Valorant not running — launching now")
         tokens = launch_and_wait()
     if not tokens:
-        # launch_and_wait already scheduled recheck + slept on timeout
         return
     at, et, puuid = tokens
     log(f"Authenticated — PUUID: {puuid[:8]}...")
@@ -381,9 +427,9 @@ def main():
         skins, remaining = get_shop(at, et, puuid)
         vp               = get_vp(at, et, puuid)
     except Exception as e:
-        log(f"ERROR fetching shop data: {e}")
+        log(f"ERROR fetching shop: {e}")
         fresh_state = state if is_recheck else {"day": today}
-        d_send(f"❌ Failed to fetch shop: `{e}`\nGoing to sleep — retrying in {RECHECK_HOURS}h.")
+        d_send(content=f"❌ Failed to fetch shop: `{e}`\nGoing to sleep — retrying in {RECHECK_HOURS}h.")
         go_sleep(fresh_state)
         return
 
@@ -397,24 +443,22 @@ def main():
 
     if last_id and is_recheck:
         missed = d_messages(last_id)
-        log(f"Scanning {len(missed)} missed message(s) from Discord...")
-
-        for msg in reversed(missed):  # oldest → newest
+        log(f"Scanning {len(missed)} missed message(s)...")
+        for msg in reversed(missed):
             if msg["author"]["id"] == bot_id:
                 continue
             content = msg["content"].strip().lower()
             state["last_msg_id"] = msg["id"]
-            log(f"  Missed message: '{content}'")
+            log(f"  Missed: '{content}'")
 
             if pending:
                 if content == "confirm":
-                    log("'confirm' found in missed messages — executing purchase now")
+                    log("Confirm found in missed messages — purchasing now")
                     if do_purchase(at, et, pending):
                         return
                     pending = None
                     state.pop("pending", None)
                 elif content in ("cancel", "no"):
-                    log(f"'{content}' found — clearing pending purchase")
                     pending = None
                     state.pop("pending", None)
                     if content == "no":
@@ -425,7 +469,7 @@ def main():
                 if m:
                     skin = match_skin(m.group(1), skins)
                     if skin:
-                        log(f"Buy request found in missed messages: {skin['name']}")
+                        log(f"Buy request in missed messages: {skin['name']}")
                         pending = skin
                         state["pending"] = skin
                 elif content == "no":
@@ -434,33 +478,15 @@ def main():
 
         save_state(state)
 
-    # ── Post shop / confirmation to Discord ────────────────────────────────────
+    # ── Post to Discord ────────────────────────────────────────────────────────
+    log("Posting to Discord...")
     if pending:
-        log(f"Pending purchase: {pending['name']} — re-posting confirmation")
         vp     = get_vp(at, et, puuid)
-        msg_id = d_send(embed={
-            "title": "⚠️ Confirm Purchase",
-            "description": (
-                f"Buy **{pending['name']}** for **{pending['vp']} VP**?\n"
-                f"Balance: **{vp} VP**\n\n"
-                f"`confirm` to buy  ·  `cancel` to go back  ·  `no` to skip"
-            ),
-            "color": 0xFFA500,
-        })
-        log(f"Confirmation embed posted (message ID: {msg_id})")
+        msg_id = d_send(embeds=[confirm_embed(pending, vp)])
+        log(f"Confirmation embed posted (skin: {pending['name']})")
     else:
-        title  = "🔫 Valorant Daily Shop" if not is_recheck else "🔫 Shop Reminder"
-        msg_id = d_send(embed={
-            "title": title,
-            "description": (
-                f"{skin_list(skins)}\n\n"
-                f"⏱ Resets in **{fmt_time(remaining)}**\n"
-                f"💰 Balance: **{vp} VP**\n\n"
-                f"`buy <name or #>` to purchase  ·  `no` to skip"
-            ),
-            "color": 0xFF4655,
-        })
-        log(f"Shop embed posted (message ID: {msg_id})")
+        msg_id = d_send(embeds=shop_embeds(skins, remaining, vp, is_recheck))
+        log(f"Shop embeds posted (msg ID: {msg_id})")
 
     state["last_msg_id"] = msg_id
     save_state(state)
@@ -488,7 +514,6 @@ def main():
                 if content == "confirm":
                     if do_purchase(at, et, pending):
                         return
-                    # Failed — clear pending and let user retry
                     pending = None
                     state.pop("pending", None)
                     save_state(state)
@@ -497,7 +522,7 @@ def main():
                     pending = None
                     state.pop("pending", None)
                     save_state(state)
-                    d_send("❌ Cancelled. Reply `buy <skin>` to pick something else.")
+                    d_send(content="❌ Cancelled. Reply `buy <skin>` to pick something else.")
                 elif content == "no":
                     go_sleep(state, "👋 Got it.")
                     return
@@ -513,20 +538,12 @@ def main():
                         pending = skin
                         state["pending"] = skin
                         vp  = get_vp(at, et, puuid)
-                        cid = d_send(embed={
-                            "title": "⚠️ Confirm Purchase",
-                            "description": (
-                                f"Buy **{skin['name']}** for **{skin['vp']} VP**?\n"
-                                f"Balance: **{vp} VP**\n\n"
-                                f"`confirm` to buy  ·  `cancel` to go back  ·  `no` to skip"
-                            ),
-                            "color": 0xFFA500,
-                        })
+                        cid = d_send(embeds=[confirm_embed(skin, vp)])
                         state["last_msg_id"] = cid
                         save_state(state)
                     else:
-                        log(f"No match for '{m.group(1)}' in today's shop")
-                        d_send(f"❌ Couldn't find `{m.group(1)}` in today's shop.")
+                        log(f"No match for '{m.group(1)}'")
+                        d_send(content=f"❌ Couldn't find `{m.group(1)}` in today's shop.")
 
     log(f"No response in {WAIT_MINUTES} min — going to sleep")
     go_sleep(state, f"⏰ No response in {WAIT_MINUTES} min.")
