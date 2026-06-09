@@ -25,6 +25,7 @@ if hasattr(sys.stdout, "reconfigure"):
 # ── Config ────────────────────────────────────────────────────────────────────
 DISCORD_TOKEN   = os.environ.get("DISCORD_BOT_TOKEN")
 DISCORD_CHANNEL = os.environ.get("DISCORD_CHANNEL_ID")
+PREFIX          = os.environ.get("BOT_PREFIX", "!")   # bot ignores messages without this
 SCRIPT_DIR      = Path(__file__).parent
 
 VP_CURRENCY  = "85ad13f7-3d1b-5128-9eb2-7cd8ee0b5741"
@@ -228,7 +229,7 @@ def shop_embeds(skins, remaining, vp, mention=None):
         "description": (
             f"**🔫 {who}Daily Shop**\n"
             f"⏱ Resets in **{fmt_time(remaining)}**  ·  💰 **{vp} VP**\n\n"
-            f"`buy <name or #>` to purchase  ·  `nm` for night market"
+            f"`{PREFIX}buy <name or #>` to purchase  ·  `{PREFIX}nm` for night market"
         ),
         "color": 0x202225,
     }
@@ -249,7 +250,7 @@ def nm_embeds(skins, remaining, vp, mention=None):
         "description": (
             f"**🌙 {who}Night Market**\n"
             f"⏱ Ends in **{fmt_time(remaining)}**  ·  💰 **{vp} VP**\n\n"
-            f"`buy nm1` / `buy <name>` to purchase at the discounted price"
+            f"`{PREFIX}buy nm1` / `{PREFIX}buy <name>` to purchase at the discounted price"
         ),
         "color": 0x202225,
     }
@@ -276,7 +277,7 @@ def confirm_embed(skin, vp):
             f"**{skin['name']}**\n"
             f"{price_line}\n"
             f"Balance: **{vp} VP**\n\n"
-            f"`confirm` to buy  ·  `cancel` to abort"
+            f"`{PREFIX}confirm` to buy  ·  `{PREFIX}cancel` to abort"
         ),
         "color": skin.get("color", 0xFFA500),
     }
@@ -458,8 +459,13 @@ def main():
             last_id = msg["id"]
             author  = msg["author"]["id"]
             text    = msg["content"].strip()
-            cmd     = text.lower()
-            log(f"[{msg['author'].get('username', author[:8])}] {text[:80]}")
+
+            # Ignore messages that don't start with the prefix
+            if not text.startswith(PREFIX):
+                continue
+
+            cmd = text[len(PREFIX):].strip().lower()
+            log(f"[{msg['author'].get('username', author[:8])}] {PREFIX}{cmd[:80]}")
 
             if author not in _accounts:
                 continue   # ignore users who aren't configured
