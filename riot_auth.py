@@ -82,7 +82,8 @@ def login(username: str, password: str, region: str = "na") -> dict:
     }, headers=_HEADERS, timeout=15)
     if not _r0.ok:
         raise ValueError(f"Auth init failed {_r0.status_code}: {_r0.text[:500]}")
-    _r0.raise_for_status()
+    print(f"[debug] POST cookies: {list(sess.cookies.keys())}", flush=True)
+    print(f"[debug] POST body: {_r0.text[:200]}", flush=True)
 
     r = sess.put(f"{AUTH_BASE}/api/v1/authorization", json={
         "type": "auth", "username": username, "password": password, "remember": True,
