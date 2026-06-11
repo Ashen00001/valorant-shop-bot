@@ -165,33 +165,37 @@ def _parse_nm(sf):
         })
     return skins, bs.get("BonusStoreRemainingDurationInSeconds", 0)
 
-def _parse_bundle(sf):
-    """Returns (name, image_url, items, seconds_remaining) or None."""
-    fb = sf.get("FeaturedBundle", {})
-    raw = fb.get("Bundle") or next(iter(fb.get("Bundles") or []), None)
-    if not raw:
-        return None
+def _parse_bundles(sf):
+    """Returns list of {name, image, items, remaining} — one per active bundle."""
+    fb  = sf.get("FeaturedBundle", {})
+    raw_bundles = fb.get("Bundles") or ([fb["Bundle"]] if fb.get("Bundle") else [])
+    if not raw_bundles:
+        return []
     skins_cache   = _build_skins_cache()
     bundles_cache = _build_bundles_cache()
-    bundle_uuid   = raw.get("DataAssetID", "")
-    bundle_meta   = bundles_cache.get(bundle_uuid, {})
-    name          = bundle_meta.get("displayName", "Featured Bundle")
-    image         = bundle_meta.get("displayIcon") or bundle_meta.get("verticalPromoImage")
-    items = []
-    for item in raw.get("Items", []):
-        if item.get("Item", {}).get("ItemTypeID") != ITEM_TYPE_ID:
-            continue
-        oid  = item["Item"]["ItemID"]
-        sd   = skins_cache.get(oid, {})
-        items.append({
-            "name":    sd.get("name", oid),
-            "vp":      item.get("DiscountedPrice", item.get("BasePrice", 0)),
-            "orig_vp": item.get("BasePrice", 0),
-            "icon":    sd.get("icon"),
-            "color":   sd.get("color", 0xFF4655),
-        })
-    remaining = fb.get("BundleRemainingDurationInSeconds", 0)
-    return name, image, items, remaining
+    out = []
+    for raw in raw_bundles:
+        bundle_uuid = raw.get("DataAssetID", "")
+        bundle_meta = bundles_cache.get(bundle_uuid, {})
+        name        = bundle_meta.get("displayName", "Featured Bundle")
+        image       = bundle_meta.get("displayIcon") or bundle_meta.get("verticalPromoImage")
+        items = []
+        for item in raw.get("Items", []):
+            if item.get("Item", {}).get("ItemTypeID") != ITEM_TYPE_ID:
+                continue
+            oid = item["Item"]["ItemID"]
+            sd  = skins_cache.get(oid, {})
+            items.append({
+                "name":    sd.get("name", oid),
+                "vp":      item.get("DiscountedPrice", item.get("BasePrice", 0)),
+                "orig_vp": item.get("BasePrice", 0),
+                "icon":    sd.get("icon"),
+                "color":   sd.get("color", 0xFF4655),
+            })
+        remaining = raw.get("DurationRemainingInSeconds",
+                            fb.get("BundleRemainingDurationInSeconds", 0))
+        out.append({"name": name, "image": image, "items": items, "remaining": remaining})
+    return out
 
 def _get_vp(at, et, puuid, region):
     r = requests.get(f"https://pd.{region}.a.pvp.net/store/v1/wallet/{puuid}",
@@ -452,7 +456,7 @@ async def cmd_nm(interaction: discord.Interaction):
         await interaction.followup.send(f"❌ Failed: `{e}`")
 
 
-@tree.command(name="bundle", description="See the current featured bundle")
+@tree.command(name="bundle", description="See the current featured bundle(s)")
 @_user_install
 @_all_contexts
 async def cmd_bundle(interaction: discord.Interaction):
@@ -466,33 +470,38 @@ async def cmd_bundle(interaction: discord.Interaction):
         if not at:
             await interaction.followup.send("❌ Auth error — run `/setup` to re-link.")
             return
-        sf     = await asyncio.to_thread(_fetch_storefront, at, et, acct["puuid"], acct["region"])
-        result = await asyncio.to_thread(_parse_bundle, sf)
-        if not result:
+        sf      = await asyncio.to_thread(_fetch_storefront, at, et, acct["puuid"], acct["region"])
+        bundles = await asyncio.to_thread(_parse_bundles, sf)
+        if not bundles:
             await interaction.followup.send(embed=discord.Embed(
-                description="No featured bundle right now.", color=0x202225))
+                description="No featured bundles right now.", color=0x202225))
             return
-        name, image, items, remaining = result
 
-        header = discord.Embed(
-            title=f"🎁 {name}",
-            description=f"⏱ Ends in **{fmt_time(remaining)}**",
-            color=0xFF4655,
-        )
-        if image:
-            header.set_image(url=image)
-        embeds = [header]
-        for s in items:
-            e = discord.Embed(title=s["name"], color=s["color"])
-            if s["orig_vp"] and s["orig_vp"] != s["vp"]:
-                e.description = f"~~{s['orig_vp']:,} VP~~ → **{s['vp']:,} VP**"
-            else:
-                e.description = f"**{s['vp']:,} VP**"
-            if s.get("icon"):
-                e.set_thumbnail(url=s["icon"])
-            embeds.append(e)
-        await interaction.followup.send(embeds=embeds[:10])
-        log(f"Bundle posted for {uid[:10]}...")
+        # One message per bundle — each with its own name, image, and items
+        for b in bundles:
+            total = sum(s["vp"] for s in b["items"])
+            header = discord.Embed(
+                title=f"🎁 {b['name']} Bundle",
+                description=(
+                    f"⏱ Ends in **{fmt_time(b['remaining'])}**"
+                    + (f"  ·  💰 Full bundle ≈ **{total:,} VP**" if total else "")
+                ),
+                color=0xFF4655,
+            )
+            if b["image"]:
+                header.set_image(url=b["image"])
+            embeds = [header]
+            for s in b["items"]:
+                e = discord.Embed(title=s["name"], color=s["color"])
+                if s["orig_vp"] and s["orig_vp"] != s["vp"]:
+                    e.description = f"~~{s['orig_vp']:,} VP~~ → **{s['vp']:,} VP**"
+                else:
+                    e.description = f"**{s['vp']:,} VP**"
+                if s.get("icon"):
+                    e.set_thumbnail(url=s["icon"])
+                embeds.append(e)
+            await interaction.followup.send(embeds=embeds[:10])
+        log(f"{len(bundles)} bundle(s) posted for {uid[:10]}...")
     except Exception as e:
         await interaction.followup.send(f"❌ Failed: `{e}`")
 
