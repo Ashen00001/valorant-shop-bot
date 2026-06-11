@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 Valorant Shop Bot — discord.py edition
-Slash commands, works in DMs and servers, buy confirmation buttons.
+Slash commands, works in DMs and servers.
+Commands: /shop /nm /bundle /buy /setup /wishlist
 """
 
-import os, sys, re, time, asyncio
+import os, sys, re, time, json, asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,7 +20,9 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DISCORD_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
+DISCORD_TOKEN  = os.environ.get("DISCORD_BOT_TOKEN")
+SCRIPT_DIR     = Path(__file__).parent
+WISHLIST_FILE  = SCRIPT_DIR / "wishlist.json"
 
 VP_CURRENCY  = "85ad13f7-3d1b-5128-9eb2-7cd8ee0b5741"
 ITEM_TYPE_ID = "e7c63390-eda7-46e0-bb7a-a6abdacd2433"
@@ -41,25 +44,41 @@ RARITY_COLORS = {
 # ── State ─────────────────────────────────────────────────────────────────────
 _client_version = None
 _skins_cache    = None
-_accounts       = {}   # user_id str → account dict
-_pending_setups = {}   # user_id str → {verifier, region, ts}
-_session_cache  = {}   # user_id str → {shop, nm}
-_last_posted    = {}   # user_id str → "YYYY-MM-DD"
+_bundles_cache  = None
+_accounts       = {}   # uid → account dict
+_pending_setups = {}   # uid → {verifier, region, ts}
+_session_cache  = {}   # uid → {shop, nm}
+_last_posted    = {}   # uid → "YYYY-MM-DD"
+_wishlist       = {}   # uid → [skin_name_lower, ...]
+_dismissed      = {}   # uid → {skin_name_lower: date_str} — suppressed until next reset
 
-
-# ── Bot setup ─────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
-intents.message_content = True   # needed to read DM messages (redirect URL)
-
+intents.message_content = True
 bot  = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
+
+_user_install = app_commands.allowed_installs(guilds=True, users=True)
+_all_contexts = app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
+def _today():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-# ── Valorant helpers (sync — called via asyncio.to_thread) ────────────────────
+
+# ── Wishlist persistence ───────────────────────────────────────────────────────
+def _load_wishlist():
+    global _wishlist
+    if WISHLIST_FILE.exists():
+        _wishlist = json.loads(WISHLIST_FILE.read_text())
+
+def _save_wishlist():
+    WISHLIST_FILE.write_text(json.dumps(_wishlist, indent=2))
+
+
+# ── Valorant helpers ──────────────────────────────────────────────────────────
 def _get_client_version():
     global _client_version
     if not _client_version:
@@ -85,6 +104,15 @@ def _build_skins_cache():
             _skins_cache[level["uuid"]] = {"name": name, "icon": icon, "color": color}
     log(f"Skins cache ready ({len(_skins_cache)} levels)")
     return _skins_cache
+
+def _build_bundles_cache():
+    global _bundles_cache
+    if _bundles_cache is not None:
+        return _bundles_cache
+    r = requests.get("https://valorant-api.com/v1/bundles?language=en-US", timeout=15)
+    r.raise_for_status()
+    _bundles_cache = {b["uuid"]: b for b in r.json()["data"]}
+    return _bundles_cache
 
 def _vh(at, et):
     return {
@@ -137,6 +165,34 @@ def _parse_nm(sf):
         })
     return skins, bs.get("BonusStoreRemainingDurationInSeconds", 0)
 
+def _parse_bundle(sf):
+    """Returns (name, image_url, items, seconds_remaining) or None."""
+    fb = sf.get("FeaturedBundle", {})
+    raw = fb.get("Bundle") or next(iter(fb.get("Bundles") or []), None)
+    if not raw:
+        return None
+    skins_cache   = _build_skins_cache()
+    bundles_cache = _build_bundles_cache()
+    bundle_uuid   = raw.get("DataAssetID", "")
+    bundle_meta   = bundles_cache.get(bundle_uuid, {})
+    name          = bundle_meta.get("displayName", "Featured Bundle")
+    image         = bundle_meta.get("displayIcon") or bundle_meta.get("verticalPromoImage")
+    items = []
+    for item in raw.get("Items", []):
+        if item.get("Item", {}).get("ItemTypeID") != ITEM_TYPE_ID:
+            continue
+        oid  = item["Item"]["ItemID"]
+        sd   = skins_cache.get(oid, {})
+        items.append({
+            "name":    sd.get("name", oid),
+            "vp":      item.get("DiscountedPrice", item.get("BasePrice", 0)),
+            "orig_vp": item.get("BasePrice", 0),
+            "icon":    sd.get("icon"),
+            "color":   sd.get("color", 0xFF4655),
+        })
+    remaining = fb.get("BundleRemainingDurationInSeconds", 0)
+    return name, image, items, remaining
+
 def _get_vp(at, et, puuid, region):
     r = requests.get(f"https://pd.{region}.a.pvp.net/store/v1/wallet/{puuid}",
                      headers=_vh(at, et), timeout=10)
@@ -163,7 +219,6 @@ def _load_accounts():
             log(f"WARNING: Could not load account {did}: {e}")
 
 def _get_tokens_for(uid):
-    """Sync. Returns (at, et, account) or (None, None, None)."""
     acct = _accounts.get(uid)
     if not acct:
         return None, None, None
@@ -197,33 +252,9 @@ def _shop_embeds(skins, remaining, vp):
         embeds.append(e)
     return embeds
 
-def _nm_embeds(skins, remaining, vp):
-    if not skins:
-        return [discord.Embed(description="🌙 Night Market isn't active right now.", color=0x202225)]
-    header = discord.Embed(
-        description=(
-            f"**🌙 Night Market**\n"
-            f"⏱ Ends in **{fmt_time(remaining)}**  ·  💰 **{vp:,} VP**"
-        ),
-        color=0x202225,
-    )
-    embeds = [header]
-    for i, s in enumerate(skins):
-        e = discord.Embed(
-            title=f"`NM{i+1}.`  {s['name']}",
-            description=f"~~{s['orig_vp']:,} VP~~ → **{s['vp']:,} VP**  (-{s['disc_pct']}%)",
-            color=s["color"],
-        )
-        if s.get("icon"):
-            e.set_thumbnail(url=s["icon"])
-        embeds.append(e)
-    return embeds
-
 def _confirm_embed(skin, vp):
-    if skin.get("is_nm"):
-        price = f"~~{skin['orig_vp']:,} VP~~ → **{skin['vp']:,} VP** (-{skin['disc_pct']}%)"
-    else:
-        price = f"**{skin['vp']:,} VP**"
+    price = (f"~~{skin['orig_vp']:,} VP~~ → **{skin['vp']:,} VP** (-{skin['disc_pct']}%)"
+             if skin.get("is_nm") else f"**{skin['vp']:,} VP**")
     e = discord.Embed(
         title="⚠️ Confirm Purchase",
         description=f"**{skin['name']}**\n{price}\nBalance: **{vp:,} VP**",
@@ -234,6 +265,47 @@ def _confirm_embed(skin, vp):
     return e
 
 
+# ── Night Market reveal view ──────────────────────────────────────────────────
+class RevealButton(discord.ui.Button):
+    def __init__(self, idx, skin, uid):
+        super().__init__(label=f"#{idx + 1}", style=discord.ButtonStyle.secondary,
+                         emoji="🎴", row=idx // 3)
+        self.idx  = idx
+        self.skin = skin
+        self.uid  = uid
+
+    async def callback(self, interaction: discord.Interaction):
+        if str(interaction.user.id) != self.uid:
+            await interaction.response.send_message("Not your night market!", ephemeral=True)
+            return
+        s = self.skin
+        self.label    = s["name"][:22]
+        self.style    = discord.ButtonStyle.success
+        self.emoji    = None
+        self.disabled = True
+
+        e = discord.Embed(
+            title=f"🎴  {s['name']}",
+            description=(
+                f"~~{s['orig_vp']:,} VP~~ → **{s['vp']:,} VP**\n"
+                f"**-{s['disc_pct']}% off**"
+            ),
+            color=s["color"],
+        )
+        if s.get("icon"):
+            e.set_thumbnail(url=s["icon"])
+
+        await interaction.response.edit_message(view=self.view)
+        await interaction.followup.send(embed=e)
+
+
+class NMRevealView(discord.ui.View):
+    def __init__(self, uid, nm_skins):
+        super().__init__(timeout=600)
+        for i, skin in enumerate(nm_skins):
+            self.add_item(RevealButton(i, skin, uid))
+
+
 # ── Buy confirmation buttons ──────────────────────────────────────────────────
 class BuyView(discord.ui.View):
     def __init__(self, uid, skin):
@@ -241,28 +313,10 @@ class BuyView(discord.ui.View):
         self.uid  = uid
         self.skin = skin
 
-    @discord.ui.button(label="Buy", style=discord.ButtonStyle.green, emoji="✅")
-    async def buy(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if str(interaction.user.id) != self.uid:
-            await interaction.response.send_message("Not your purchase.", ephemeral=True)
-            return
-        await interaction.response.defer()
-        try:
-            at, et, acct = await asyncio.to_thread(_get_tokens_for, self.uid)
-            if not at:
-                await interaction.followup.send("❌ Auth error — try `/setup` again.")
-                self.stop(); return
-            ok, resp = await asyncio.to_thread(
-                _do_order, at, et, acct["puuid"], acct["region"], self.skin["offer_id"]
-            )
-        except Exception as e:
-            await interaction.followup.send(f"❌ Error: `{e}`")
-            self.stop(); return
-
+    async def _finish(self, interaction, ok, resp=None):
         for child in self.children:
             child.disabled = True
         await interaction.message.edit(view=self)
-
         if ok:
             log(f"Purchase OK: {self.skin['name']} for {self.uid[:10]}...")
             desc = f"**{self.skin['name']}** for **{self.skin['vp']:,} VP**"
@@ -274,9 +328,27 @@ class BuyView(discord.ui.View):
                 result.set_thumbnail(url=self.skin["icon"])
             await interaction.followup.send(embed=result)
         else:
-            log(f"Purchase FAILED: {resp[:200]}")
             await interaction.followup.send(f"❌ Purchase failed: `{resp[:200]}`")
         self.stop()
+
+    @discord.ui.button(label="Buy", style=discord.ButtonStyle.green, emoji="✅")
+    async def buy(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.uid:
+            await interaction.response.send_message("Not your purchase.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        try:
+            at, et, acct = await asyncio.to_thread(_get_tokens_for, self.uid)
+            if not at:
+                await interaction.followup.send("❌ Auth error — run `/setup`.")
+                self.stop(); return
+            ok, resp = await asyncio.to_thread(
+                _do_order, at, et, acct["puuid"], acct["region"], self.skin["offer_id"]
+            )
+            await self._finish(interaction, ok, resp)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error: `{e}`")
+            self.stop()
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red, emoji="❌")
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -289,23 +361,37 @@ class BuyView(discord.ui.View):
         await interaction.response.send_message("❌ Cancelled.", ephemeral=True)
         self.stop()
 
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
+
+# ── Wishlist notification view ────────────────────────────────────────────────
+class WishlistDismissView(discord.ui.View):
+    def __init__(self, uid, skin_name):
+        super().__init__(timeout=None)
+        self.uid       = uid
+        self.skin_name = skin_name
+
+    @discord.ui.button(label="Dismiss", style=discord.ButtonStyle.secondary, emoji="🔕")
+    async def dismiss(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.uid:
+            await interaction.response.send_message("Not your notification.", ephemeral=True)
+            return
+        _dismissed.setdefault(self.uid, {})[self.skin_name.lower()] = _today()
+        button.disabled = True
+        button.label    = "Dismissed"
+        await interaction.message.edit(view=self)
+        await interaction.response.send_message(
+            "🔕 Got it — no more pings for this skin until your shop resets.", ephemeral=True
+        )
+        self.stop()
 
 
 # ── Slash commands ────────────────────────────────────────────────────────────
-_user_install   = app_commands.allowed_installs(guilds=True, users=True)
-_all_contexts   = app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-
 @tree.command(name="shop", description="See your daily Valorant shop")
 @_user_install
 @_all_contexts
 async def cmd_shop(interaction: discord.Interaction):
     uid = str(interaction.user.id)
     if uid not in _accounts:
-        await interaction.response.send_message(
-            "You haven't linked your account yet. Run `/setup` first!", ephemeral=True)
+        await interaction.response.send_message("Run `/setup` to link your account first!", ephemeral=True)
         return
     await interaction.response.defer()
     try:
@@ -315,22 +401,20 @@ async def cmd_shop(interaction: discord.Interaction):
             return
         sf               = await asyncio.to_thread(_fetch_storefront, at, et, acct["puuid"], acct["region"])
         skins, remaining = _parse_shop(sf)
-        nm_skins, nm_rem = _parse_nm(sf)
+        nm_skins, _      = _parse_nm(sf)
         vp               = await asyncio.to_thread(_get_vp, at, et, acct["puuid"], acct["region"])
 
         _session_cache[uid] = {"shop": skins, "nm": nm_skins}
         _last_posted[uid]   = _today()
 
         await interaction.followup.send(embeds=_shop_embeds(skins, remaining, vp))
-        if nm_skins:
-            await interaction.followup.send(embeds=_nm_embeds(nm_skins, nm_rem, vp))
         log(f"Shop posted for {uid[:10]}...")
     except Exception as e:
         log(f"Shop error for {uid[:10]}...: {e}")
         await interaction.followup.send(f"❌ Failed: `{e}`")
 
 
-@tree.command(name="nm", description="See your Valorant night market")
+@tree.command(name="nm", description="Reveal your Valorant night market")
 @_user_install
 @_all_contexts
 async def cmd_nm(interaction: discord.Interaction):
@@ -348,8 +432,67 @@ async def cmd_nm(interaction: discord.Interaction):
         nm_skins, nm_rem = _parse_nm(sf)
         vp               = await asyncio.to_thread(_get_vp, at, et, acct["puuid"], acct["region"])
         _session_cache.setdefault(uid, {})["nm"] = nm_skins
-        await interaction.followup.send(embeds=_nm_embeds(nm_skins, nm_rem, vp))
-        log(f"NM posted for {uid[:10]}...")
+
+        if not nm_skins:
+            await interaction.followup.send(embed=discord.Embed(
+                description="🌙 Night Market isn't active right now.", color=0x202225))
+            return
+
+        header = discord.Embed(
+            description=(
+                f"**🌙 Night Market**\n"
+                f"⏱ Ends in **{fmt_time(nm_rem)}**  ·  💰 **{vp:,} VP**\n\n"
+                f"Tap a card to reveal it."
+            ),
+            color=0x202225,
+        )
+        await interaction.followup.send(embed=header, view=NMRevealView(uid, nm_skins))
+        log(f"NM reveal sent to {uid[:10]}...")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed: `{e}`")
+
+
+@tree.command(name="bundle", description="See the current featured bundle")
+@_user_install
+@_all_contexts
+async def cmd_bundle(interaction: discord.Interaction):
+    uid = str(interaction.user.id)
+    if uid not in _accounts:
+        await interaction.response.send_message("Run `/setup` first!", ephemeral=True)
+        return
+    await interaction.response.defer()
+    try:
+        at, et, acct = await asyncio.to_thread(_get_tokens_for, uid)
+        if not at:
+            await interaction.followup.send("❌ Auth error — run `/setup` to re-link.")
+            return
+        sf     = await asyncio.to_thread(_fetch_storefront, at, et, acct["puuid"], acct["region"])
+        result = await asyncio.to_thread(_parse_bundle, sf)
+        if not result:
+            await interaction.followup.send(embed=discord.Embed(
+                description="No featured bundle right now.", color=0x202225))
+            return
+        name, image, items, remaining = result
+
+        header = discord.Embed(
+            title=f"🎁 {name}",
+            description=f"⏱ Ends in **{fmt_time(remaining)}**",
+            color=0xFF4655,
+        )
+        if image:
+            header.set_image(url=image)
+        embeds = [header]
+        for s in items:
+            e = discord.Embed(title=s["name"], color=s["color"])
+            if s["orig_vp"] and s["orig_vp"] != s["vp"]:
+                e.description = f"~~{s['orig_vp']:,} VP~~ → **{s['vp']:,} VP**"
+            else:
+                e.description = f"**{s['vp']:,} VP**"
+            if s.get("icon"):
+                e.set_thumbnail(url=s["icon"])
+            embeds.append(e)
+        await interaction.followup.send(embeds=embeds[:10])
+        log(f"Bundle posted for {uid[:10]}...")
     except Exception as e:
         await interaction.followup.send(f"❌ Failed: `{e}`")
 
@@ -363,19 +506,14 @@ async def cmd_buy(interaction: discord.Interaction, skin: str):
     cached = _session_cache.get(uid, {})
     shop   = cached.get("shop", [])
     nm     = cached.get("nm") or []
-
     if not shop and not nm:
-        await interaction.response.send_message(
-            "Run `/shop` first so I know what's in your store.", ephemeral=True)
+        await interaction.response.send_message("Run `/shop` first.", ephemeral=True)
         return
-
     match = _match(skin, shop) or _match(skin, nm)
     if not match:
         await interaction.response.send_message(
-            f"No match for `{skin}` — use a number like `2`, `nm3`, or a partial name.",
-            ephemeral=True)
+            f"No match for `{skin}` — use a number like `2`, `nm3`, or a partial name.", ephemeral=True)
         return
-
     await interaction.response.defer()
     try:
         at, et, acct = await asyncio.to_thread(_get_tokens_for, uid)
@@ -386,29 +524,76 @@ async def cmd_buy(interaction: discord.Interaction, skin: str):
     except Exception as e:
         await interaction.followup.send(f"❌ Error: `{e}`")
         return
-
-    log(f"Buy prompt: {match['name']} for {uid[:10]}...")
     await interaction.followup.send(embed=_confirm_embed(match, vp), view=BuyView(uid, match))
 
 
+# ── Wishlist commands ─────────────────────────────────────────────────────────
+wishlist_group = app_commands.Group(name="wishlist", description="Manage your skin wishlist")
+tree.add_command(wishlist_group)
+
+@wishlist_group.command(name="add", description="Add a skin to your wishlist")
+@_user_install
+@_all_contexts
+@app_commands.describe(skin="Skin name to watch for (e.g. 'Oni Phantom')")
+async def wl_add(interaction: discord.Interaction, skin: str):
+    uid  = str(interaction.user.id)
+    name = skin.strip().lower()
+    wl   = _wishlist.setdefault(uid, [])
+    if name in wl:
+        await interaction.response.send_message(f"**{skin}** is already on your wishlist.", ephemeral=True)
+        return
+    wl.append(name)
+    _save_wishlist()
+    await interaction.response.send_message(
+        f"✅ Added **{skin}** to your wishlist. I'll ping you when it shows up in your shop.", ephemeral=True)
+
+@wishlist_group.command(name="remove", description="Remove a skin from your wishlist")
+@_user_install
+@_all_contexts
+@app_commands.describe(skin="Skin name to remove")
+async def wl_remove(interaction: discord.Interaction, skin: str):
+    uid  = str(interaction.user.id)
+    name = skin.strip().lower()
+    wl   = _wishlist.get(uid, [])
+    if name not in wl:
+        await interaction.response.send_message(f"**{skin}** isn't on your wishlist.", ephemeral=True)
+        return
+    wl.remove(name)
+    _save_wishlist()
+    await interaction.response.send_message(f"🗑️ Removed **{skin}** from your wishlist.", ephemeral=True)
+
+@wishlist_group.command(name="view", description="See your current wishlist")
+@_user_install
+@_all_contexts
+async def wl_view(interaction: discord.Interaction):
+    uid = str(interaction.user.id)
+    wl  = _wishlist.get(uid, [])
+    if not wl:
+        await interaction.response.send_message("Your wishlist is empty. Use `/wishlist add` to add skins.", ephemeral=True)
+        return
+    lines = "\n".join(f"• {s.title()}" for s in wl)
+    await interaction.response.send_message(
+        embed=discord.Embed(title="🎯 Your Wishlist", description=lines, color=0xFF4655),
+        ephemeral=True)
+
+
+# ── Setup command ─────────────────────────────────────────────────────────────
 @tree.command(name="setup", description="Link your Riot/Valorant account")
 @_user_install
 @_all_contexts
 @app_commands.describe(region="Your Valorant region (default: na)")
 @app_commands.choices(region=[
-    app_commands.Choice(name="NA", value="na"),
-    app_commands.Choice(name="EU", value="eu"),
-    app_commands.Choice(name="AP", value="ap"),
-    app_commands.Choice(name="KR", value="kr"),
-    app_commands.Choice(name="BR", value="br"),
+    app_commands.Choice(name="NA",    value="na"),
+    app_commands.Choice(name="EU",    value="eu"),
+    app_commands.Choice(name="AP",    value="ap"),
+    app_commands.Choice(name="KR",    value="kr"),
+    app_commands.Choice(name="BR",    value="br"),
     app_commands.Choice(name="LATAM", value="latam"),
 ])
 async def cmd_setup(interaction: discord.Interaction, region: str = "na"):
-    uid      = str(interaction.user.id)
+    uid              = str(interaction.user.id)
     auth_url, verifier = riot_auth.get_browser_login_url()
-
     _pending_setups[uid] = {"verifier": verifier, "region": region, "ts": time.time()}
-
     embed = discord.Embed(
         title="🔗 Link your Valorant account",
         description=(
@@ -420,96 +605,122 @@ async def cmd_setup(interaction: discord.Interaction, region: str = "na"):
         ),
         color=0xFF4655,
     )
-
-    # Send ephemeral so the OAuth link stays somewhat private
     await interaction.response.send_message(embed=embed, ephemeral=True)
     log(f"Setup started for {uid[:10]}... (region={region})")
 
 
-# ── DM listener (catches redirect URL pasted by user after /setup) ────────────
+# ── DM listener ───────────────────────────────────────────────────────────────
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
     if not isinstance(message.channel, discord.DMChannel):
         return
-
     uid = str(message.author.id)
     if uid not in _pending_setups:
         return
-
     content = message.content.strip()
     setup   = _pending_setups[uid]
-
     if time.time() - setup["ts"] > SETUP_TIMEOUT:
         _pending_setups.pop(uid, None)
         await message.channel.send("⏱ That link expired. Run `/setup` again.")
         return
-
     if "localhost/redirect" not in content and "code=" not in content:
         await message.channel.send(
-            "Paste the **full URL** from your browser address bar.\n"
-            "It starts with `http://localhost/redirect?code=...`"
-        )
+            "Paste the **full URL** from your address bar — starts with `http://localhost/redirect?code=...`")
         return
-
     await message.channel.send("⏳ Linking account...")
     try:
         account = await asyncio.to_thread(
-            riot_auth.complete_browser_login, content, setup["verifier"], setup["region"]
-        )
+            riot_auth.complete_browser_login, content, setup["verifier"], setup["region"])
     except Exception as e:
         await message.channel.send(f"❌ Failed: `{e}`\nRun `/setup` again.")
         _pending_setups.pop(uid, None)
         return
-
     _accounts[uid] = account
     all_accts      = riot_auth.load_accounts()
     all_accts[uid] = account
     riot_auth.save_accounts(all_accts)
     _pending_setups.pop(uid, None)
-
-    await message.channel.send(
-        "✅ **Account linked!**\nYou can now use `/shop`, `/nm`, and `/buy` anywhere."
-    )
+    await message.channel.send("✅ **Account linked!**\nYou can now use `/shop`, `/nm`, `/bundle`, and `/buy` anywhere.")
     log(f"Account linked: {uid[:10]}... (puuid {account['puuid'][:8]}...)")
 
 
-# ── Auto-post daily shop at midnight UTC ──────────────────────────────────────
+# ── Auto-post daily shop ──────────────────────────────────────────────────────
 @tasks.loop(minutes=1)
 async def auto_post():
     now   = datetime.now(timezone.utc)
     today = _today()
     if now.hour == 0 and now.minute < 10:
+        # Clear dismissed on new shop day
+        for uid in list(_dismissed.keys()):
+            _dismissed[uid] = {k: v for k, v in _dismissed[uid].items() if v == today}
+
         for uid in list(_accounts.keys()):
             if _last_posted.get(uid) == today:
                 continue
             try:
-                user = await bot.fetch_user(int(uid))
-                at, et, acct = await asyncio.to_thread(_get_tokens_for, uid)
+                user             = await bot.fetch_user(int(uid))
+                at, et, acct     = await asyncio.to_thread(_get_tokens_for, uid)
                 if not at:
                     continue
                 sf               = await asyncio.to_thread(_fetch_storefront, at, et, acct["puuid"], acct["region"])
                 skins, remaining = _parse_shop(sf)
-                nm_skins, nm_rem = _parse_nm(sf)
+                nm_skins, _      = _parse_nm(sf)
                 vp               = await asyncio.to_thread(_get_vp, at, et, acct["puuid"], acct["region"])
-
                 _session_cache[uid] = {"shop": skins, "nm": nm_skins}
                 _last_posted[uid]   = today
-
                 await user.send(embeds=_shop_embeds(skins, remaining, vp))
-                if nm_skins:
-                    await user.send(embeds=_nm_embeds(nm_skins, nm_rem, vp))
                 log(f"Auto-posted shop to {uid[:10]}...")
                 await asyncio.sleep(3)
             except Exception as e:
                 log(f"Auto-post failed for {uid[:10]}...: {e}")
 
 
-# ── Misc ──────────────────────────────────────────────────────────────────────
-def _today():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+# ── Wishlist check (every 3 hours) ────────────────────────────────────────────
+@tasks.loop(hours=3)
+async def wishlist_check():
+    today = _today()
+    for uid, wish_skins in list(_wishlist.items()):
+        if not wish_skins or uid not in _accounts:
+            continue
+        try:
+            at, et, acct = await asyncio.to_thread(_get_tokens_for, uid)
+            if not at:
+                continue
+            sf           = await asyncio.to_thread(_fetch_storefront, at, et, acct["puuid"], acct["region"])
+            shop, _      = _parse_shop(sf)
+            nm, _        = _parse_nm(sf)
+            all_skins    = (shop or []) + (nm or [])
+            dismissed    = _dismissed.get(uid, {})
 
+            for skin in all_skins:
+                name_lower = skin["name"].lower()
+                if not any(w in name_lower for w in wish_skins):
+                    continue
+                matched_wish = next(w for w in wish_skins if w in name_lower)
+                if dismissed.get(matched_wish) == today:
+                    continue
+
+                user  = await bot.fetch_user(int(uid))
+                label = "🌙 Night Market" if skin.get("is_nm") else "🔫 Daily Shop"
+                price = (f"~~{skin['orig_vp']:,} VP~~ → **{skin['vp']:,} VP** (-{skin['disc_pct']}%)"
+                         if skin.get("is_nm") else f"**{skin['vp']:,} VP**")
+                e = discord.Embed(
+                    title=f"🎯 Wishlist hit — {skin['name']}",
+                    description=f"{label}\n{price}\n\nUse `/buy` to purchase.",
+                    color=skin["color"],
+                )
+                if skin.get("icon"):
+                    e.set_thumbnail(url=skin["icon"])
+                await user.send(embed=e, view=WishlistDismissView(uid, matched_wish))
+                log(f"Wishlist ping: {skin['name']} → {uid[:10]}...")
+                await asyncio.sleep(1)
+        except Exception as e:
+            log(f"Wishlist check failed for {uid[:10]}...: {e}")
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def _match(q, skins):
     q       = q.strip().lower()
     idx_str = re.sub(r"^nm", "", q)
@@ -526,12 +737,15 @@ async def on_ready():
     log(f"Logged in as {bot.user} ({bot.user.id})")
     log("=" * 55)
     await asyncio.to_thread(_load_accounts)
+    await asyncio.to_thread(_load_wishlist)
     log(f"{len(_accounts)} account(s) loaded")
     await asyncio.to_thread(_build_skins_cache)
+    await asyncio.to_thread(_build_bundles_cache)
     await tree.sync()
     log("Slash commands synced globally")
     auto_post.start()
-    log("Auto-post scheduler started (fires at 00:00 UTC)")
+    wishlist_check.start()
+    log("Tasks started")
 
 
 if not DISCORD_TOKEN:
