@@ -5,7 +5,11 @@
 set -e
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-SERVICE_FILE="$REPO_DIR/deploy/shopbot.service"
+SERVICE_FILE=$(mktemp)
+CURR_USER="$(whoami)"
+
+# Stamp the service file with the actual user and paths
+sed "s|ubuntu|$CURR_USER|g" "$REPO_DIR/deploy/shopbot.service" > "$SERVICE_FILE"
 
 echo "=== Valorant Shop Bot — VPS setup ==="
 echo "Repo: $REPO_DIR"
@@ -38,6 +42,7 @@ fi
 # systemd service
 echo "[3/4] Installing systemd service..."
 sudo cp "$SERVICE_FILE" /etc/systemd/system/shopbot.service
+rm -f "$SERVICE_FILE"
 sudo systemctl daemon-reload
 sudo systemctl enable shopbot
 echo "      Service installed and enabled."

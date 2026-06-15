@@ -5,9 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=azureuser
-WorkingDirectory=/home/azureuser/valorant-shop-bot
-EnvironmentFile=/home/azureuser/valorant-shop-bot/config.env
+User=ubuntu
+WorkingDirectory=/home/ubuntu/valorant-shop-bot
+EnvironmentFile=/home/ubuntu/valorant-shop-bot/config.env
+ExecStartPre=-/usr/bin/git -C /home/ubuntu/valorant-shop-bot pull
+ExecStartPre=-/usr/bin/pip3 install -q -r /home/ubuntu/valorant-shop-bot/requirements.txt
 ExecStart=/usr/bin/python3 -u bot.py
 Restart=always
 RestartSec=15
