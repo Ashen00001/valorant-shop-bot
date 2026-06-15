@@ -211,6 +211,20 @@ def _do_order(at, et, puuid, region, offer_id):
     )
     return r.status_code == 200, r.text
 
+def _fetch_inventory(at, et, puuid, region):
+    r = requests.get(
+        f"https://pd.{region}.a.pvp.net/store/v1/entitlements/{puuid}/{ITEM_TYPE_ID}",
+        headers=_vh(at, et), timeout=15,
+    )
+    r.raise_for_status()
+    cache = _build_skins_cache()
+    owned = []
+    for e in r.json().get("Entitlements", []):
+        iid  = e.get("ItemID", "")
+        info = cache.get(iid, {})
+        owned.append({"id": iid, "name": info.get("name", iid), "icon": info.get("icon"), "color": info.get("color", 0xFF4655)})
+    return owned
+
 def _load_accounts():
     global _accounts
     raw = riot_auth.load_accounts()
@@ -533,6 +547,56 @@ async def cmd_buy(interaction: discord.Interaction, skin: str):
         await interaction.followup.send(f"❌ Error: `{e}`")
         return
     await interaction.followup.send(embed=_confirm_embed(match, vp), view=BuyView(uid, match))
+
+
+# ── Inventory command ────────────────────────────────────────────────────────
+@tree.command(name="inventory", description="Check if you own a skin (or search your owned skins)")
+@_user_install
+@_all_contexts
+@app_commands.describe(skin="Skin name to look up (e.g. 'Oni Phantom'). Leave blank to see your 10 most recent.")
+async def cmd_inventory(interaction: discord.Interaction, skin: str = ""):
+    uid = str(interaction.user.id)
+    if uid not in _accounts:
+        await interaction.response.send_message("Run `/setup` first!", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        at, et, acct = await asyncio.to_thread(_get_tokens_for, uid)
+        if not at:
+            await interaction.followup.send("❌ Auth error — run `/setup`.", ephemeral=True)
+            return
+        owned = await asyncio.to_thread(_fetch_inventory, at, et, acct["puuid"], acct["region"])
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to fetch inventory: `{e}`", ephemeral=True)
+        return
+
+    if skin:
+        query   = skin.strip().lower()
+        matches = [s for s in owned if query in s["name"].lower()]
+        if not matches:
+            await interaction.followup.send(
+                embed=discord.Embed(description=f"❌ **{skin}** not found in your inventory.", color=0xFF4655),
+                ephemeral=True)
+        else:
+            embeds = []
+            for s in matches[:5]:
+                e = discord.Embed(title=f"✅ {s['name']}", description="You own this skin.", color=s["color"])
+                if s["icon"]:
+                    e.set_thumbnail(url=s["icon"])
+                embeds.append(e)
+            await interaction.followup.send(embeds=embeds, ephemeral=True)
+    else:
+        if not owned:
+            await interaction.followup.send("Your inventory is empty.", ephemeral=True)
+            return
+        lines = "\n".join(f"• {s['name']}" for s in owned[-10:])
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title=f"🎒 Inventory ({len(owned)} skins)",
+                description=f"Showing 10 most recent:\n{lines}\n\nUse `/inventory <name>` to search.",
+                color=0xFF4655,
+            ),
+            ephemeral=True)
 
 
 # ── Wishlist commands ─────────────────────────────────────────────────────────
