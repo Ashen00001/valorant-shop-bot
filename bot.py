@@ -318,9 +318,6 @@ class BuyView(discord.ui.View):
         self.skin = skin
 
     async def _finish(self, interaction, ok, resp=None):
-        for child in self.children:
-            child.disabled = True
-        await interaction.message.edit(view=self)
         if ok:
             log(f"Purchase OK: {self.skin['name']} for {self.uid[:10]}...")
             desc = f"**{self.skin['name']}** for **{self.skin['vp']:,} VP**"
@@ -340,7 +337,9 @@ class BuyView(discord.ui.View):
         if str(interaction.user.id) != self.uid:
             await interaction.response.send_message("Not your purchase.", ephemeral=True)
             return
-        await interaction.response.defer()
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
         try:
             at, et, acct = await asyncio.to_thread(_get_tokens_for, self.uid)
             if not at:
@@ -361,8 +360,8 @@ class BuyView(discord.ui.View):
             return
         for child in self.children:
             child.disabled = True
-        await interaction.message.edit(view=self)
-        await interaction.response.send_message("❌ Cancelled.", ephemeral=True)
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send("❌ Cancelled.", ephemeral=True)
         self.stop()
 
 
@@ -381,8 +380,8 @@ class WishlistDismissView(discord.ui.View):
         _dismissed.setdefault(self.uid, {})[self.skin_name.lower()] = _today()
         button.disabled = True
         button.label    = "Dismissed"
-        await interaction.message.edit(view=self)
-        await interaction.response.send_message(
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(
             "🔕 Got it — no more pings for this skin until your shop resets.", ephemeral=True
         )
         self.stop()
