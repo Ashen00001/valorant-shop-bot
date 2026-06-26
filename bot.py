@@ -116,11 +116,12 @@ def _build_bundles_cache():
 
 def _vh(at, et):
     return {
-        "Authorization":          f"Bearer {at}",
+        "Authorization":           f"Bearer {at}",
         "X-Riot-Entitlements-JWT": et,
         "X-Riot-ClientPlatform":   CLIENT_PLATFORM,
         "X-Riot-ClientVersion":    _get_client_version(),
-        "Content-Type":           "application/json",
+        "Content-Type":            "application/json",
+        "User-Agent":              "ShooterGame/13 Windows/10.0.19043.1.256.64bit",
     }
 
 def _fetch_storefront(at, et, puuid, region):
