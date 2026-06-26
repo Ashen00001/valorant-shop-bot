@@ -204,7 +204,7 @@ def _get_vp(at, et, puuid, region):
     return r.json()["Balances"].get(VP_CURRENCY, 0)
 
 def _do_order(at, et, puuid, region, offer_id):
-    payload = {"OfferId": offer_id, "ItemTypeId": ITEM_TYPE_ID, "Quantity": 1}
+    payload = {"Transactions": [{"OfferId": offer_id, "ItemTypeId": ITEM_TYPE_ID, "Quantity": 1}]}
     log(f"Order request → region={region} offer={offer_id}")
     r = requests.post(
         f"https://pd.{region}.a.pvp.net/store/v1/order",
