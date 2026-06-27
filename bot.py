@@ -204,10 +204,12 @@ def _get_vp(at, et, puuid, region):
     return r.json()["Balances"].get(VP_CURRENCY, 0)
 
 def _do_order(at, et, puuid, region, offer_id):
-    payload = {"Transactions": [{"OfferId": offer_id, "ItemTypeId": ITEM_TYPE_ID, "Quantity": 1}]}
+    # Documented store-order shape. NOTE: Riot reliably 500s on orders placed from
+    # outside a live game client — this works only if driven against a running client.
+    payload = {"OfferId": offer_id, "ItemTypeId": ITEM_TYPE_ID, "Quantity": 1}
     log(f"Order request → region={region} offer={offer_id}")
     r = requests.post(
-        f"https://pd.{region}.a.pvp.net/store/v1/order",
+        f"https://pd.{region}.a.pvp.net/store/v1/order/",
         headers=_vh(at, et),
         json=payload,
         timeout=15,
@@ -403,7 +405,17 @@ class BuyView(discord.ui.View):
                 result.set_thumbnail(url=self.skin["icon"])
             await interaction.followup.send(embed=result)
         else:
-            await interaction.followup.send(f"❌ Purchase failed: `{resp[:200]}`")
+            log(f"Purchase failed for {self.uid[:10]}...: {resp[:200]}")
+            note = discord.Embed(
+                title="⚠️ Couldn't complete the purchase",
+                description=(
+                    f"Riot rejected the order for **{self.skin['name']}**.\n\n"
+                    "Buying through the bot isn't reliable — Riot blocks store orders placed "
+                    "from outside the game client. Open **Valorant** and grab it in the in-game store."
+                ),
+                color=0xED4245,
+            )
+            await interaction.followup.send(embed=note)
         self.stop()
 
     @discord.ui.button(label="Buy", style=discord.ButtonStyle.green, emoji="✅")
