@@ -64,10 +64,15 @@ def main():
     print(f"PUUID: {account['puuid']}")
 
     accounts = riot_auth.load_accounts()
-    accounts[discord_id] = account
+    existing = accounts.get(discord_id, [])
+    if not isinstance(existing, list):     # migrate old single-account format
+        existing = [existing]
+    existing = [a for a in existing if a.get("puuid") != account["puuid"]]  # re-link replaces, no dupes
+    existing.append(account)
+    accounts[discord_id] = existing
     riot_auth.save_accounts(accounts)
 
-    print(f"\n✅ Saved to accounts.json")
+    print(f"\n✅ Saved to accounts.json ({len(existing)} account(s) for this user)")
     print()
     print("Next: copy accounts.json to the VPS:")
     print(f'  scp -i "%USERPROFILE%\\.ssh\\shopbot" accounts.json ubuntu@<your-vps-ip>:/home/ubuntu/valorant-shop-bot/accounts.json')

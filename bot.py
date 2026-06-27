@@ -45,10 +45,10 @@ RARITY_COLORS = {
 _client_version = None
 _skins_cache    = None
 _bundles_cache  = None
-_accounts       = {}   # uid → account dict
+_accounts       = {}   # uid → [account dict, ...]
 _pending_setups = {}   # uid → {verifier, region, ts}
-_session_cache  = {}   # uid → {shop, nm}
-_last_posted    = {}   # uid → "YYYY-MM-DD"
+_session_cache  = {}   # "uid:idx" → {shop, nm}
+_last_posted    = {}   # "uid:idx" → "YYYY-MM-DD"
 _wishlist       = {}   # uid → [skin_name_lower, ...]
 _dismissed      = {}   # uid → {skin_name_lower: date_str} — suppressed until next reset
 
@@ -229,27 +229,82 @@ def _fetch_inventory(at, et, puuid, region):
         owned.append({"id": iid, "name": info.get("name", iid), "icon": info.get("icon"), "color": info.get("color", 0xFF4655)})
     return owned
 
+def _riot_name(at, et, puuid, region):
+    """Fetch the account's GameName#Tag, used to label linked accounts."""
+    r = requests.put(
+        f"https://pd.{region}.a.pvp.net/name-service/v2/players",
+        headers=_vh(at, et), json=[puuid], timeout=10,
+    )
+    r.raise_for_status()
+    d = r.json()[0]
+    return f"{d['GameName']}#{d['TagLine']}"
+
+def _ck(uid, idx):
+    """Composite cache key — a user can have several linked accounts."""
+    return f"{uid}:{idx}"
+
+def _persist_accounts():
+    riot_auth.save_accounts(_accounts)
+
+def _account_label(acct, i):
+    return acct.get("label") or f"account {i + 1}"
+
 def _load_accounts():
     global _accounts
     raw = riot_auth.load_accounts()
-    for did, acct in raw.items():
-        try:
-            at, et, puuid, updated = riot_auth.get_tokens(acct)
-            _accounts[did] = updated
-            log(f"Account ready: {did[:10]}... (puuid {puuid[:8]}...)")
-        except Exception as e:
-            log(f"WARNING: Could not load account {did}: {e}")
+    for did, value in raw.items():
+        entries = value if isinstance(value, list) else [value]   # migrate old one-account format
+        loaded  = []
+        for acct in entries:
+            try:
+                at, et, puuid, updated = riot_auth.get_tokens(acct)
+                if not updated.get("label"):
+                    try:
+                        updated["label"] = _riot_name(at, et, puuid, updated["region"])
+                    except Exception:
+                        updated["label"] = puuid[:8]
+                loaded.append(updated)
+                log(f"Account ready: {did[:10]}... {updated['label']} (puuid {puuid[:8]}...)")
+            except Exception as e:
+                loaded.append(acct)   # keep it so a transient failure doesn't drop it on save
+                log(f"WARNING: Could not load account {did} ({acct.get('label', '?')}): {e}")
+        if loaded:
+            _accounts[did] = loaded
+    _persist_accounts()   # write back migrated format + any new labels
 
-def _get_tokens_for(uid):
-    acct = _accounts.get(uid)
-    if not acct:
+def _get_tokens_for(uid, idx=0):
+    accts = _accounts.get(uid)
+    if not accts or not (0 <= idx < len(accts)):
         return None, None, None
-    at, et, puuid, updated = riot_auth.get_tokens(acct)
-    _accounts[uid] = updated
-    all_accts = riot_auth.load_accounts()
-    all_accts[uid] = updated
-    riot_auth.save_accounts(all_accts)
+    label = accts[idx].get("label")
+    at, et, puuid, updated = riot_auth.get_tokens(accts[idx])
+    if label:
+        updated["label"] = label
+    accts[idx] = updated
+    _persist_accounts()
     return at, et, updated
+
+def _resolve_account(uid, account):
+    """Map a user-supplied string (label substring or 1-based number) to an index, or None."""
+    accts = _accounts.get(uid, [])
+    if not accts:
+        return None
+    if not account:
+        return 0
+    q = account.strip().lower()
+    if q.isdigit():
+        i = int(q) - 1
+        return i if 0 <= i < len(accts) else None
+    return next((i for i, a in enumerate(accts) if q in _account_label(a, i).lower()), None)
+
+async def _account_autocomplete(interaction: discord.Interaction, current: str):
+    uid = str(interaction.user.id)
+    cur = current.lower()
+    return [
+        app_commands.Choice(name=_account_label(a, i), value=_account_label(a, i))
+        for i, a in enumerate(_accounts.get(uid, []))
+        if cur in _account_label(a, i).lower()
+    ][:25]
 
 
 # ── Embed builders ────────────────────────────────────────────────────────────
@@ -330,10 +385,11 @@ class NMRevealView(discord.ui.View):
 
 # ── Buy confirmation buttons ──────────────────────────────────────────────────
 class BuyView(discord.ui.View):
-    def __init__(self, uid, skin):
+    def __init__(self, uid, skin, idx=0):
         super().__init__(timeout=120)
         self.uid  = uid
         self.skin = skin
+        self.idx  = idx
 
     async def _finish(self, interaction, ok, resp=None):
         if ok:
@@ -359,7 +415,7 @@ class BuyView(discord.ui.View):
             child.disabled = True
         await interaction.response.edit_message(view=self)
         try:
-            at, et, acct = await asyncio.to_thread(_get_tokens_for, self.uid)
+            at, et, acct = await asyncio.to_thread(_get_tokens_for, self.uid, self.idx)
             if not at:
                 await interaction.followup.send("❌ Auth error — run `/setup`.")
                 self.stop(); return
@@ -409,14 +465,21 @@ class WishlistDismissView(discord.ui.View):
 @tree.command(name="shop", description="See your daily Valorant shop")
 @_user_install
 @_all_contexts
-async def cmd_shop(interaction: discord.Interaction):
+@app_commands.describe(account="Which linked account (name or number) — omit for your first")
+@app_commands.autocomplete(account=_account_autocomplete)
+async def cmd_shop(interaction: discord.Interaction, account: str = None):
     uid = str(interaction.user.id)
     if uid not in _accounts:
         await interaction.response.send_message("Run `/setup` to link your account first!", ephemeral=True)
         return
+    idx = _resolve_account(uid, account)
+    if idx is None:
+        await interaction.response.send_message(
+            f"No linked account matches `{account}`. See `/accounts`.", ephemeral=True)
+        return
     await interaction.response.defer()
     try:
-        at, et, acct = await asyncio.to_thread(_get_tokens_for, uid)
+        at, et, acct = await asyncio.to_thread(_get_tokens_for, uid, idx)
         if not at:
             await interaction.followup.send("❌ Auth error — run `/setup` to re-link.")
             return
@@ -425,11 +488,11 @@ async def cmd_shop(interaction: discord.Interaction):
         nm_skins, _      = _parse_nm(sf)
         vp               = await asyncio.to_thread(_get_vp, at, et, acct["puuid"], acct["region"])
 
-        _session_cache[uid] = {"shop": skins, "nm": nm_skins}
-        _last_posted[uid]   = _today()
+        _session_cache[_ck(uid, idx)] = {"shop": skins, "nm": nm_skins}
+        _last_posted[_ck(uid, idx)]   = _today()
 
         await interaction.followup.send(embeds=_shop_embeds(skins, remaining, vp))
-        log(f"Shop posted for {uid[:10]}...")
+        log(f"Shop posted for {uid[:10]}... ({acct.get('label', '?')})")
     except Exception as e:
         log(f"Shop error for {uid[:10]}...: {e}")
         await interaction.followup.send(f"❌ Failed: `{e}`")
@@ -438,21 +501,28 @@ async def cmd_shop(interaction: discord.Interaction):
 @tree.command(name="nm", description="Reveal your Valorant night market")
 @_user_install
 @_all_contexts
-async def cmd_nm(interaction: discord.Interaction):
+@app_commands.describe(account="Which linked account (name or number) — omit for your first")
+@app_commands.autocomplete(account=_account_autocomplete)
+async def cmd_nm(interaction: discord.Interaction, account: str = None):
     uid = str(interaction.user.id)
     if uid not in _accounts:
         await interaction.response.send_message("Run `/setup` first!", ephemeral=True)
         return
+    idx = _resolve_account(uid, account)
+    if idx is None:
+        await interaction.response.send_message(
+            f"No linked account matches `{account}`. See `/accounts`.", ephemeral=True)
+        return
     await interaction.response.defer()
     try:
-        at, et, acct = await asyncio.to_thread(_get_tokens_for, uid)
+        at, et, acct = await asyncio.to_thread(_get_tokens_for, uid, idx)
         if not at:
             await interaction.followup.send("❌ Auth error — run `/setup` to re-link.")
             return
         sf               = await asyncio.to_thread(_fetch_storefront, at, et, acct["puuid"], acct["region"])
         nm_skins, nm_rem = _parse_nm(sf)
         vp               = await asyncio.to_thread(_get_vp, at, et, acct["puuid"], acct["region"])
-        _session_cache.setdefault(uid, {})["nm"] = nm_skins
+        _session_cache.setdefault(_ck(uid, idx), {})["nm"] = nm_skins
 
         if not nm_skins:
             await interaction.followup.send(embed=discord.Embed(
@@ -476,14 +546,21 @@ async def cmd_nm(interaction: discord.Interaction):
 @tree.command(name="bundle", description="See the current featured bundle(s)")
 @_user_install
 @_all_contexts
-async def cmd_bundle(interaction: discord.Interaction):
+@app_commands.describe(account="Which linked account (name or number) — omit for your first")
+@app_commands.autocomplete(account=_account_autocomplete)
+async def cmd_bundle(interaction: discord.Interaction, account: str = None):
     uid = str(interaction.user.id)
     if uid not in _accounts:
         await interaction.response.send_message("Run `/setup` first!", ephemeral=True)
         return
+    idx = _resolve_account(uid, account)
+    if idx is None:
+        await interaction.response.send_message(
+            f"No linked account matches `{account}`. See `/accounts`.", ephemeral=True)
+        return
     await interaction.response.defer()
     try:
-        at, et, acct = await asyncio.to_thread(_get_tokens_for, uid)
+        at, et, acct = await asyncio.to_thread(_get_tokens_for, uid, idx)
         if not at:
             await interaction.followup.send("❌ Auth error — run `/setup` to re-link.")
             return
@@ -526,10 +603,20 @@ async def cmd_bundle(interaction: discord.Interaction):
 @tree.command(name="buy", description="Buy a skin from your shop or night market")
 @_user_install
 @_all_contexts
-@app_commands.describe(skin="Skin name or number (e.g. 'phantom', '2', 'nm3')")
-async def cmd_buy(interaction: discord.Interaction, skin: str):
-    uid    = str(interaction.user.id)
-    cached = _session_cache.get(uid, {})
+@app_commands.describe(skin="Skin name or number (e.g. 'phantom', '2', 'nm3')",
+                       account="Which linked account (name or number) — omit for your first")
+@app_commands.autocomplete(account=_account_autocomplete)
+async def cmd_buy(interaction: discord.Interaction, skin: str, account: str = None):
+    uid = str(interaction.user.id)
+    if uid not in _accounts:
+        await interaction.response.send_message("Run `/setup` first!", ephemeral=True)
+        return
+    idx = _resolve_account(uid, account)
+    if idx is None:
+        await interaction.response.send_message(
+            f"No linked account matches `{account}`. See `/accounts`.", ephemeral=True)
+        return
+    cached = _session_cache.get(_ck(uid, idx), {})
     shop   = cached.get("shop", [])
     nm     = cached.get("nm") or []
     if not shop and not nm:
@@ -542,7 +629,7 @@ async def cmd_buy(interaction: discord.Interaction, skin: str):
         return
     await interaction.response.defer()
     try:
-        at, et, acct = await asyncio.to_thread(_get_tokens_for, uid)
+        at, et, acct = await asyncio.to_thread(_get_tokens_for, uid, idx)
         if not at:
             await interaction.followup.send("❌ Auth error.")
             return
@@ -550,22 +637,29 @@ async def cmd_buy(interaction: discord.Interaction, skin: str):
     except Exception as e:
         await interaction.followup.send(f"❌ Error: `{e}`")
         return
-    await interaction.followup.send(embed=_confirm_embed(match, vp), view=BuyView(uid, match))
+    await interaction.followup.send(embed=_confirm_embed(match, vp), view=BuyView(uid, match, idx))
 
 
 # ── Inventory command ────────────────────────────────────────────────────────
 @tree.command(name="inventory", description="Check if you own a skin (or search your owned skins)")
 @_user_install
 @_all_contexts
-@app_commands.describe(skin="Skin name to look up (e.g. 'Oni Phantom'). Leave blank to see your 10 most recent.")
-async def cmd_inventory(interaction: discord.Interaction, skin: str = ""):
+@app_commands.describe(skin="Skin name to look up (e.g. 'Oni Phantom'). Leave blank to see your 10 most recent.",
+                       account="Which linked account (name or number) — omit for your first")
+@app_commands.autocomplete(account=_account_autocomplete)
+async def cmd_inventory(interaction: discord.Interaction, skin: str = "", account: str = None):
     uid = str(interaction.user.id)
     if uid not in _accounts:
         await interaction.response.send_message("Run `/setup` first!", ephemeral=True)
         return
+    idx = _resolve_account(uid, account)
+    if idx is None:
+        await interaction.response.send_message(
+            f"No linked account matches `{account}`. See `/accounts`.", ephemeral=True)
+        return
     await interaction.response.defer(ephemeral=True)
     try:
-        at, et, acct = await asyncio.to_thread(_get_tokens_for, uid)
+        at, et, acct = await asyncio.to_thread(_get_tokens_for, uid, idx)
         if not at:
             await interaction.followup.send("❌ Auth error — run `/setup`.", ephemeral=True)
             return
@@ -601,6 +695,55 @@ async def cmd_inventory(interaction: discord.Interaction, skin: str = ""):
                 color=0xFF4655,
             ),
             ephemeral=True)
+
+
+# ── Account management ────────────────────────────────────────────────────────
+@tree.command(name="accounts", description="List the Valorant accounts you've linked")
+@_user_install
+@_all_contexts
+async def cmd_accounts(interaction: discord.Interaction):
+    uid   = str(interaction.user.id)
+    accts = _accounts.get(uid, [])
+    if not accts:
+        await interaction.response.send_message("No accounts linked yet. Run `/setup`.", ephemeral=True)
+        return
+    lines = "\n".join(
+        f"**{i + 1}.** {_account_label(a, i)}  ·  `{a.get('region', '?').upper()}`"
+        for i, a in enumerate(accts)
+    )
+    await interaction.response.send_message(
+        embed=discord.Embed(
+            title="🎮 Your linked accounts",
+            description=lines + "\n\nUse the `account:` option on `/shop`, `/nm`, `/bundle`, `/buy`, or `/inventory`.",
+            color=0xFF4655,
+        ),
+        ephemeral=True)
+
+
+@tree.command(name="unlink", description="Remove one of your linked Valorant accounts")
+@_user_install
+@_all_contexts
+@app_commands.describe(account="Which account to remove (name or number)")
+@app_commands.autocomplete(account=_account_autocomplete)
+async def cmd_unlink(interaction: discord.Interaction, account: str):
+    uid = str(interaction.user.id)
+    idx = _resolve_account(uid, account)
+    if idx is None:
+        await interaction.response.send_message(
+            f"No linked account matches `{account}`. See `/accounts`.", ephemeral=True)
+        return
+    removed = _accounts[uid].pop(idx)
+    if not _accounts[uid]:
+        _accounts.pop(uid, None)
+    # indexes shift after removal — drop this user's cached shops so /buy can't hit a stale account
+    for k in [k for k in _session_cache if k.startswith(f"{uid}:")]:
+        _session_cache.pop(k, None)
+    for k in [k for k in _last_posted if k.startswith(f"{uid}:")]:
+        _last_posted.pop(k, None)
+    _persist_accounts()
+    await interaction.response.send_message(
+        f"🗑️ Unlinked **{removed.get('label', 'account')}**.", ephemeral=True)
+    log(f"Account unlinked: {uid[:10]}... {removed.get('label', '?')}")
 
 
 # ── Wishlist commands ─────────────────────────────────────────────────────────
@@ -713,13 +856,25 @@ async def on_message(message: discord.Message):
         await message.channel.send(f"❌ Failed: `{e}`\nRun `/setup` again.")
         _pending_setups.pop(uid, None)
         return
-    _accounts[uid] = account
-    all_accts      = riot_auth.load_accounts()
-    all_accts[uid] = account
-    riot_auth.save_accounts(all_accts)
+    # label the new account by its Riot name, refreshing once to get valid tokens
+    try:
+        at, et, puuid, account = await asyncio.to_thread(riot_auth.get_tokens, account)
+        account["label"] = await asyncio.to_thread(_riot_name, at, et, puuid, account["region"])
+    except Exception:
+        account["label"] = account.get("puuid", "")[:8]
+
+    accts = _accounts.setdefault(uid, [])
+    accts[:] = [a for a in accts if a.get("puuid") != account.get("puuid")]  # re-link replaces, no dupes
+    accts.append(account)
+    _persist_accounts()
     _pending_setups.pop(uid, None)
-    await message.channel.send("✅ **Account linked!**\nYou can now use `/shop`, `/nm`, `/bundle`, and `/buy` anywhere.")
-    log(f"Account linked: {uid[:10]}... (puuid {account['puuid'][:8]}...)")
+    n = len(accts)
+    extra = (f"\nYou now have **{n}** accounts — add `account:` to `/shop`, `/nm`, `/bundle`, `/inventory`, "
+             f"or `/buy` to pick one (see `/accounts`).") if n > 1 else ""
+    await message.channel.send(
+        f"✅ **Account linked!** (`{account['label']}`)\n"
+        f"You can use `/shop`, `/nm`, `/bundle`, and `/buy` anywhere.{extra}")
+    log(f"Account linked: {uid[:10]}... {account['label']} (#{n})")
 
 
 # ── Auto-post daily shop ──────────────────────────────────────────────────────
@@ -733,24 +888,29 @@ async def auto_post():
             _dismissed[uid] = {k: v for k, v in _dismissed[uid].items() if v == today}
 
         for uid in list(_accounts.keys()):
-            if _last_posted.get(uid) == today:
-                continue
-            try:
-                user             = await bot.fetch_user(int(uid))
-                at, et, acct     = await asyncio.to_thread(_get_tokens_for, uid)
-                if not at:
+            for idx in range(len(_accounts.get(uid, []))):
+                ck = _ck(uid, idx)
+                if _last_posted.get(ck) == today:
                     continue
-                sf               = await asyncio.to_thread(_fetch_storefront, at, et, acct["puuid"], acct["region"])
-                skins, remaining = _parse_shop(sf)
-                nm_skins, _      = _parse_nm(sf)
-                vp               = await asyncio.to_thread(_get_vp, at, et, acct["puuid"], acct["region"])
-                _session_cache[uid] = {"shop": skins, "nm": nm_skins}
-                _last_posted[uid]   = today
-                await user.send(embeds=_shop_embeds(skins, remaining, vp))
-                log(f"Auto-posted shop to {uid[:10]}...")
-                await asyncio.sleep(3)
-            except Exception as e:
-                log(f"Auto-post failed for {uid[:10]}...: {e}")
+                try:
+                    user             = await bot.fetch_user(int(uid))
+                    at, et, acct     = await asyncio.to_thread(_get_tokens_for, uid, idx)
+                    if not at:
+                        continue
+                    sf               = await asyncio.to_thread(_fetch_storefront, at, et, acct["puuid"], acct["region"])
+                    skins, remaining = _parse_shop(sf)
+                    nm_skins, _      = _parse_nm(sf)
+                    vp               = await asyncio.to_thread(_get_vp, at, et, acct["puuid"], acct["region"])
+                    _session_cache[ck] = {"shop": skins, "nm": nm_skins}
+                    _last_posted[ck]   = today
+                    embeds = _shop_embeds(skins, remaining, vp)
+                    if len(_accounts.get(uid, [])) > 1:
+                        embeds[0].set_author(name=_account_label(acct, idx))
+                    await user.send(embeds=embeds)
+                    log(f"Auto-posted shop to {uid[:10]}... ({acct.get('label', '?')})")
+                    await asyncio.sleep(3)
+                except Exception as e:
+                    log(f"Auto-post failed for {uid[:10]}...: {e}")
 
 
 # ── Wishlist check (every 3 hours) ────────────────────────────────────────────
@@ -760,40 +920,49 @@ async def wishlist_check():
     for uid, wish_skins in list(_wishlist.items()):
         if not wish_skins or uid not in _accounts:
             continue
-        try:
-            at, et, acct = await asyncio.to_thread(_get_tokens_for, uid)
-            if not at:
-                continue
-            sf           = await asyncio.to_thread(_fetch_storefront, at, et, acct["puuid"], acct["region"])
-            shop, _      = _parse_shop(sf)
-            nm, _        = _parse_nm(sf)
-            all_skins    = (shop or []) + (nm or [])
-            dismissed    = _dismissed.get(uid, {})
-
-            for skin in all_skins:
-                name_lower = skin["name"].lower()
-                if not any(w in name_lower for w in wish_skins):
+        accts     = _accounts.get(uid, [])
+        multi     = len(accts) > 1
+        for idx in range(len(accts)):
+            try:
+                at, et, acct = await asyncio.to_thread(_get_tokens_for, uid, idx)
+                if not at:
                     continue
-                matched_wish = next(w for w in wish_skins if w in name_lower)
-                if dismissed.get(matched_wish) == today:
-                    continue
+                acct_label   = _account_label(acct, idx)
+                sf           = await asyncio.to_thread(_fetch_storefront, at, et, acct["puuid"], acct["region"])
+                shop, _      = _parse_shop(sf)
+                nm, _        = _parse_nm(sf)
+                all_skins    = (shop or []) + (nm or [])
+                dismissed    = _dismissed.get(uid, {})
 
-                user  = await bot.fetch_user(int(uid))
-                label = "🌙 Night Market" if skin.get("is_nm") else "🔫 Daily Shop"
-                price = (f"~~{skin['orig_vp']:,} VP~~ → **{skin['vp']:,} VP** (-{skin['disc_pct']}%)"
-                         if skin.get("is_nm") else f"**{skin['vp']:,} VP**")
-                e = discord.Embed(
-                    title=f"🎯 Wishlist hit — {skin['name']}",
-                    description=f"{label}\n{price}\n\nUse `/buy` to purchase.",
-                    color=skin["color"],
-                )
-                if skin.get("icon"):
-                    e.set_thumbnail(url=skin["icon"])
-                await user.send(embed=e, view=WishlistDismissView(uid, matched_wish))
-                log(f"Wishlist ping: {skin['name']} → {uid[:10]}...")
-                await asyncio.sleep(1)
-        except Exception as e:
-            log(f"Wishlist check failed for {uid[:10]}...: {e}")
+                for skin in all_skins:
+                    name_lower = skin["name"].lower()
+                    if not any(w in name_lower for w in wish_skins):
+                        continue
+                    matched_wish = next(w for w in wish_skins if w in name_lower)
+                    # dismissals are per-account so the same skin can still ping on another account
+                    dkey = f"{matched_wish}|{idx}"
+                    if dismissed.get(dkey) == today:
+                        continue
+
+                    user  = await bot.fetch_user(int(uid))
+                    label = "🌙 Night Market" if skin.get("is_nm") else "🔫 Daily Shop"
+                    price = (f"~~{skin['orig_vp']:,} VP~~ → **{skin['vp']:,} VP** (-{skin['disc_pct']}%)"
+                             if skin.get("is_nm") else f"**{skin['vp']:,} VP**")
+                    buy_hint = f"Use `/buy account:{acct_label}`." if multi else "Use `/buy` to purchase."
+                    e = discord.Embed(
+                        title=f"🎯 Wishlist hit — {skin['name']}",
+                        description=f"{label}\n{price}\n\n{buy_hint}",
+                        color=skin["color"],
+                    )
+                    if multi:
+                        e.set_author(name=acct_label)
+                    if skin.get("icon"):
+                        e.set_thumbnail(url=skin["icon"])
+                    await user.send(embed=e, view=WishlistDismissView(uid, dkey))
+                    log(f"Wishlist ping: {skin['name']} → {uid[:10]}... ({acct_label})")
+                    await asyncio.sleep(1)
+            except Exception as e:
+                log(f"Wishlist check failed for {uid[:10]}...: {e}")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
