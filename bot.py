@@ -51,6 +51,7 @@ _session_cache  = {}   # "uid:idx" → {shop, nm}
 _last_posted    = {}   # "uid:idx" → "YYYY-MM-DD"
 _wishlist       = {}   # uid → [skin_name_lower, ...]
 _dismissed      = {}   # uid → {skin_name_lower: date_str} — suppressed until next reset
+_last_account   = {}   # uid → idx — last account this user explicitly viewed
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -287,17 +288,23 @@ def _get_tokens_for(uid, idx=0):
     return at, et, updated
 
 def _resolve_account(uid, account):
-    """Map a user-supplied string (label substring or 1-based number) to an index, or None."""
+    """Map a user string (label substring or 1-based number) to an index, or None.
+    No input → the last account this user viewed, falling back to the primary."""
     accts = _accounts.get(uid, [])
     if not accts:
         return None
     if not account:
-        return 0
+        idx = _last_account.get(uid, 0)
+        return idx if 0 <= idx < len(accts) else 0
     q = account.strip().lower()
     if q.isdigit():
         i = int(q) - 1
-        return i if 0 <= i < len(accts) else None
-    return next((i for i, a in enumerate(accts) if q in _account_label(a, i).lower()), None)
+        idx = i if 0 <= i < len(accts) else None
+    else:
+        idx = next((i for i, a in enumerate(accts) if q in _account_label(a, i).lower()), None)
+    if idx is not None:
+        _last_account[uid] = idx   # remember explicit choice for next time
+    return idx
 
 async def _account_autocomplete(interaction: discord.Interaction, current: str):
     uid = str(interaction.user.id)
@@ -314,9 +321,11 @@ def fmt_time(secs):
     h, r = divmod(max(0, int(secs)), 3600)
     return f"{h}h {r // 60}m" if h else f"{r // 60}m"
 
-def _shop_embeds(skins, remaining, vp):
+def _shop_embeds(skins, remaining, vp, label=None):
+    head = f"**👤 {label}**\n" if label else ""
     header = discord.Embed(
         description=(
+            f"{head}"
             f"**🔫 Daily Shop**\n"
             f"⏱ Resets in **{fmt_time(remaining)}**  ·  💰 **{vp:,} VP**"
         ),
@@ -477,7 +486,7 @@ class WishlistDismissView(discord.ui.View):
 @tree.command(name="shop", description="See your daily Valorant shop")
 @_user_install
 @_all_contexts
-@app_commands.describe(account="Which linked account (name or number) — omit for your first")
+@app_commands.describe(account="Which linked account (name or number) — omit for your last used")
 @app_commands.autocomplete(account=_account_autocomplete)
 async def cmd_shop(interaction: discord.Interaction, account: str = None):
     uid = str(interaction.user.id)
@@ -503,7 +512,8 @@ async def cmd_shop(interaction: discord.Interaction, account: str = None):
         _session_cache[_ck(uid, idx)] = {"shop": skins, "nm": nm_skins}
         _last_posted[_ck(uid, idx)]   = _today()
 
-        await interaction.followup.send(embeds=_shop_embeds(skins, remaining, vp))
+        label = _account_label(acct, idx) if len(_accounts.get(uid, [])) > 1 else None
+        await interaction.followup.send(embeds=_shop_embeds(skins, remaining, vp, label))
         log(f"Shop posted for {uid[:10]}... ({acct.get('label', '?')})")
     except Exception as e:
         log(f"Shop error for {uid[:10]}...: {e}")
@@ -513,7 +523,7 @@ async def cmd_shop(interaction: discord.Interaction, account: str = None):
 @tree.command(name="nm", description="Reveal your Valorant night market")
 @_user_install
 @_all_contexts
-@app_commands.describe(account="Which linked account (name or number) — omit for your first")
+@app_commands.describe(account="Which linked account (name or number) — omit for your last used")
 @app_commands.autocomplete(account=_account_autocomplete)
 async def cmd_nm(interaction: discord.Interaction, account: str = None):
     uid = str(interaction.user.id)
@@ -541,8 +551,11 @@ async def cmd_nm(interaction: discord.Interaction, account: str = None):
                 description="🌙 Night Market isn't active right now.", color=0x202225))
             return
 
+        label = _account_label(acct, idx) if len(_accounts.get(uid, [])) > 1 else None
+        head  = f"**👤 {label}**\n" if label else ""
         header = discord.Embed(
             description=(
+                f"{head}"
                 f"**🌙 Night Market**\n"
                 f"⏱ Ends in **{fmt_time(nm_rem)}**  ·  💰 **{vp:,} VP**\n\n"
                 f"Tap a card to reveal it."
@@ -558,7 +571,7 @@ async def cmd_nm(interaction: discord.Interaction, account: str = None):
 @tree.command(name="bundle", description="See the current featured bundle(s)")
 @_user_install
 @_all_contexts
-@app_commands.describe(account="Which linked account (name or number) — omit for your first")
+@app_commands.describe(account="Which linked account (name or number) — omit for your last used")
 @app_commands.autocomplete(account=_account_autocomplete)
 async def cmd_bundle(interaction: discord.Interaction, account: str = None):
     uid = str(interaction.user.id)
@@ -616,7 +629,7 @@ async def cmd_bundle(interaction: discord.Interaction, account: str = None):
 @_user_install
 @_all_contexts
 @app_commands.describe(skin="Skin name or number (e.g. 'phantom', '2', 'nm3')",
-                       account="Which linked account (name or number) — omit for your first")
+                       account="Which linked account (name or number) — omit for your last used")
 @app_commands.autocomplete(account=_account_autocomplete)
 async def cmd_buy(interaction: discord.Interaction, skin: str, account: str = None):
     uid = str(interaction.user.id)
@@ -657,7 +670,7 @@ async def cmd_buy(interaction: discord.Interaction, skin: str, account: str = No
 @_user_install
 @_all_contexts
 @app_commands.describe(skin="Skin name to look up (e.g. 'Oni Phantom'). Leave blank to see your 10 most recent.",
-                       account="Which linked account (name or number) — omit for your first")
+                       account="Which linked account (name or number) — omit for your last used")
 @app_commands.autocomplete(account=_account_autocomplete)
 async def cmd_inventory(interaction: discord.Interaction, skin: str = "", account: str = None):
     uid = str(interaction.user.id)
@@ -752,6 +765,7 @@ async def cmd_unlink(interaction: discord.Interaction, account: str):
         _session_cache.pop(k, None)
     for k in [k for k in _last_posted if k.startswith(f"{uid}:")]:
         _last_posted.pop(k, None)
+    _last_account.pop(uid, None)   # indexes shifted — forget the remembered pick
     _persist_accounts()
     await interaction.response.send_message(
         f"🗑️ Unlinked **{removed.get('label', 'account')}**.", ephemeral=True)
@@ -915,10 +929,8 @@ async def auto_post():
                     vp               = await asyncio.to_thread(_get_vp, at, et, acct["puuid"], acct["region"])
                     _session_cache[ck] = {"shop": skins, "nm": nm_skins}
                     _last_posted[ck]   = today
-                    embeds = _shop_embeds(skins, remaining, vp)
-                    if len(_accounts.get(uid, [])) > 1:
-                        embeds[0].set_author(name=_account_label(acct, idx))
-                    await user.send(embeds=embeds)
+                    label = _account_label(acct, idx) if len(_accounts.get(uid, [])) > 1 else None
+                    await user.send(embeds=_shop_embeds(skins, remaining, vp, label))
                     log(f"Auto-posted shop to {uid[:10]}... ({acct.get('label', '?')})")
                     await asyncio.sleep(3)
                 except Exception as e:
