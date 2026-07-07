@@ -42,9 +42,12 @@ RARITY_COLORS = {
 }
 
 # ── State ─────────────────────────────────────────────────────────────────────
+_http = requests.Session()   # pooled connections for all Riot / valorant-api calls
+
 _client_version = None
 _skins_cache    = None
 _bundles_cache  = None
+_cache_day      = None   # date the metadata caches were last rebuilt
 _accounts       = {}   # uid → [account dict, ...]
 _pending_setups = {}   # uid → {verifier, region, ts}
 _session_cache  = {}   # "uid:idx" → {shop, nm}
@@ -84,7 +87,7 @@ def _get_client_version():
     global _client_version
     if not _client_version:
         _client_version = (
-            requests.get("https://valorant-api.com/v1/version", timeout=10)
+            _http.get("https://valorant-api.com/v1/version", timeout=10)
             .json()["data"]["riotClientVersion"]
         )
     return _client_version
@@ -94,7 +97,7 @@ def _build_skins_cache():
     if _skins_cache is not None:
         return _skins_cache
     log("Building skins cache...")
-    r = requests.get("https://valorant-api.com/v1/weapons/skins?language=en-US", timeout=20)
+    r = _http.get("https://valorant-api.com/v1/weapons/skins?language=en-US", timeout=20)
     r.raise_for_status()
     _skins_cache = {}
     for skin in r.json()["data"]:
@@ -110,7 +113,7 @@ def _build_bundles_cache():
     global _bundles_cache
     if _bundles_cache is not None:
         return _bundles_cache
-    r = requests.get("https://valorant-api.com/v1/bundles?language=en-US", timeout=15)
+    r = _http.get("https://valorant-api.com/v1/bundles?language=en-US", timeout=15)
     r.raise_for_status()
     _bundles_cache = {b["uuid"]: b for b in r.json()["data"]}
     return _bundles_cache
@@ -126,7 +129,7 @@ def _vh(at, et):
     }
 
 def _fetch_storefront(at, et, puuid, region):
-    r = requests.post(
+    r = _http.post(
         f"https://pd.{region}.a.pvp.net/store/v3/storefront/{puuid}",
         headers=_vh(at, et), json={}, timeout=15,
     )
@@ -200,8 +203,8 @@ def _parse_bundles(sf):
     return out
 
 def _get_vp(at, et, puuid, region):
-    r = requests.get(f"https://pd.{region}.a.pvp.net/store/v1/wallet/{puuid}",
-                     headers=_vh(at, et), timeout=10)
+    r = _http.get(f"https://pd.{region}.a.pvp.net/store/v1/wallet/{puuid}",
+                  headers=_vh(at, et), timeout=10)
     return r.json()["Balances"].get(VP_CURRENCY, 0)
 
 def _do_order(at, et, puuid, region, offer_id):
@@ -209,7 +212,7 @@ def _do_order(at, et, puuid, region, offer_id):
     # outside a live game client — this works only if driven against a running client.
     payload = {"OfferId": offer_id, "ItemTypeId": ITEM_TYPE_ID, "Quantity": 1}
     log(f"Order request → region={region} offer={offer_id}")
-    r = requests.post(
+    r = _http.post(
         f"https://pd.{region}.a.pvp.net/store/v1/order/",
         headers=_vh(at, et),
         json=payload,
@@ -219,7 +222,7 @@ def _do_order(at, et, puuid, region, offer_id):
     return r.status_code == 200, r.text
 
 def _fetch_inventory(at, et, puuid, region):
-    r = requests.get(
+    r = _http.get(
         f"https://pd.{region}.a.pvp.net/store/v1/entitlements/{puuid}/{ITEM_TYPE_ID}",
         headers=_vh(at, et), timeout=15,
     )
@@ -234,7 +237,7 @@ def _fetch_inventory(at, et, puuid, region):
 
 def _riot_name(at, et, puuid, region):
     """Fetch the account's GameName#Tag, used to label linked accounts."""
-    r = requests.put(
+    r = _http.put(
         f"https://pd.{region}.a.pvp.net/name-service/v2/players",
         headers=_vh(at, et), json=[puuid], timeout=10,
     )
@@ -279,12 +282,16 @@ def _get_tokens_for(uid, idx=0):
     accts = _accounts.get(uid)
     if not accts or not (0 <= idx < len(accts)):
         return None, None, None
-    label = accts[idx].get("label")
-    at, et, puuid, updated = riot_auth.get_tokens(accts[idx])
+    old   = accts[idx]
+    label = old.get("label")
+    at, et, puuid, updated = riot_auth.get_tokens(old)
     if label:
         updated["label"] = label
     accts[idx] = updated
-    _persist_accounts()
+    # get_tokens reuses cached tokens (same dict back) most of the time —
+    # only rewrite accounts.json when a refresh actually rotated them
+    if updated is not old:
+        _persist_accounts()
     return at, et, updated
 
 def _resolve_account(uid, account):
@@ -906,20 +913,35 @@ async def on_message(message: discord.Message):
 # ── Auto-post daily shop ──────────────────────────────────────────────────────
 @tasks.loop(minutes=1)
 async def auto_post():
+    global _client_version, _skins_cache, _bundles_cache, _cache_day
     now   = datetime.now(timezone.utc)
     today = _today()
     if now.hour == 0 and now.minute < 10:
+        # Rebuild metadata caches once per day — new acts add skins, and a stale
+        # client-version header eventually gets rejected by Riot
+        if _cache_day != today:
+            _cache_day = today
+            _client_version = _skins_cache = _bundles_cache = None
+            try:
+                await asyncio.to_thread(_build_skins_cache)
+                await asyncio.to_thread(_build_bundles_cache)
+            except Exception as e:
+                log(f"Cache refresh failed (will retry next minute): {e}")
+                _cache_day = None
+
         # Clear dismissed on new shop day
         for uid in list(_dismissed.keys()):
             _dismissed[uid] = {k: v for k, v in _dismissed[uid].items() if v == today}
 
         for uid in list(_accounts.keys()):
+            user = None   # fetched once per user, only if something needs posting
             for idx in range(len(_accounts.get(uid, []))):
                 ck = _ck(uid, idx)
                 if _last_posted.get(ck) == today:
                     continue
                 try:
-                    user             = await bot.fetch_user(int(uid))
+                    if user is None:
+                        user = bot.get_user(int(uid)) or await bot.fetch_user(int(uid))
                     at, et, acct     = await asyncio.to_thread(_get_tokens_for, uid, idx)
                     if not at:
                         continue
@@ -944,8 +966,9 @@ async def wishlist_check():
     for uid, wish_skins in list(_wishlist.items()):
         if not wish_skins or uid not in _accounts:
             continue
-        accts     = _accounts.get(uid, [])
-        multi     = len(accts) > 1
+        accts = _accounts.get(uid, [])
+        multi = len(accts) > 1
+        user  = None   # fetched lazily, once per user, only when a wishlist skin hits
         for idx in range(len(accts)):
             try:
                 at, et, acct = await asyncio.to_thread(_get_tokens_for, uid, idx)
@@ -968,7 +991,8 @@ async def wishlist_check():
                     if dismissed.get(dkey) == today:
                         continue
 
-                    user  = await bot.fetch_user(int(uid))
+                    if user is None:
+                        user = bot.get_user(int(uid)) or await bot.fetch_user(int(uid))
                     label = "🌙 Night Market" if skin.get("is_nm") else "🔫 Daily Shop"
                     price = (f"~~{skin['orig_vp']:,} VP~~ → **{skin['vp']:,} VP** (-{skin['disc_pct']}%)"
                              if skin.get("is_nm") else f"**{skin['vp']:,} VP**")

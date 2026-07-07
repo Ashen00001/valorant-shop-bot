@@ -3,12 +3,13 @@ Riot Games web auth — no Valorant client or lockfile needed.
 Uses OAuth2 PKCE browser flow (riot-client).
 User logs in once via browser; refresh_token persists ~1 year.
 """
-import re, json, secrets, hashlib, base64, os, urllib.parse, requests
+import re, json, secrets, hashlib, base64, os, time, urllib.parse, requests
 from pathlib import Path
 
 ACCOUNTS_FILE = Path(__file__).parent / "accounts.json"
 AUTH_BASE     = "https://auth.riotgames.com"
 ENTITLE_BASE  = "https://entitlements.auth.riotgames.com"
+TOKEN_TTL     = 3000   # reuse access tokens for 50 min (Riot issues 60-min tokens)
 
 _HEADERS = {
     "Content-Type":    "application/json",
@@ -16,6 +17,8 @@ _HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "User-Agent":      "RiotClient/68.0.0.4940199.4789131 rso-auth (Windows;10;;Professional, x64)",
 }
+
+_session = requests.Session()   # pooled connections — skips TCP/TLS handshake per call
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -31,7 +34,7 @@ def _exchange_code(code: str, verifier: str):
     """Exchange authorization code → (access_token, refresh_token)."""
     # code may arrive URL-encoded from the browser — decode it first
     code = urllib.parse.unquote(code)
-    r = requests.post(
+    r = _session.post(
         f"{AUTH_BASE}/token",
         data={
             "grant_type":    "authorization_code",
@@ -51,7 +54,7 @@ def _exchange_code(code: str, verifier: str):
     return data["access_token"], data.get("refresh_token", "")
 
 def _entitlements(at: str) -> str:
-    r = requests.post(
+    r = _session.post(
         f"{ENTITLE_BASE}/api/token/v1", json={},
         headers={"Authorization": f"Bearer {at}", "Content-Type": "application/json"},
         timeout=10,
@@ -60,7 +63,7 @@ def _entitlements(at: str) -> str:
     return r.json()["entitlements_token"]
 
 def _puuid(at: str) -> str:
-    r = requests.get(
+    r = _session.get(
         f"{AUTH_BASE}/userinfo",
         headers={"Authorization": f"Bearer {at}"},
         timeout=10,
@@ -119,6 +122,7 @@ def complete_browser_login(redirect_url: str, verifier: str, region: str = "na")
         "access_token":       at,
         "entitlements_token": _entitlements(at),
         "refresh_token":      rt,
+        "token_ts":           time.time(),
     }
 
 def refresh(account: dict) -> dict:
@@ -130,7 +134,7 @@ def refresh(account: dict) -> dict:
     if not rt:
         raise ValueError("No refresh_token — run setup_account.py again.")
 
-    r = requests.post(
+    r = _session.post(
         f"{AUTH_BASE}/token",
         data={"grant_type": "refresh_token", "refresh_token": rt, "client_id": "riot-client"},
         headers={**_HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
@@ -152,9 +156,15 @@ def refresh(account: dict) -> dict:
         "access_token":       at,
         "entitlements_token": _entitlements(at),
         "refresh_token":      new_rt,
+        "token_ts":           time.time(),
     }
 
 def get_tokens(account: dict) -> tuple:
-    """Returns (access_token, entitlements_token, puuid, updated_account)."""
+    """Returns (access_token, entitlements_token, puuid, updated_account).
+    Reuses the cached access token until it's ~50 min old — saves two HTTP
+    round-trips per call. Refreshes (and re-stamps token_ts) only when stale."""
+    if (account.get("access_token") and account.get("entitlements_token")
+            and time.time() - account.get("token_ts", 0) < TOKEN_TTL):
+        return account["access_token"], account["entitlements_token"], account["puuid"], account
     updated = refresh(account)
     return updated["access_token"], updated["entitlements_token"], updated["puuid"], updated
