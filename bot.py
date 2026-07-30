@@ -155,6 +155,9 @@ def _parse_nm(sf):
     offers = bs.get("BonusStoreOffers")
     if not offers:
         return None, None
+    # Riot has moved this field around; log what we actually get so the timer
+    # can't silently drift from what the client shows.
+    log(f"NM meta: { {k: v for k, v in bs.items() if k != 'BonusStoreOffers'} }")
     cache = _build_skins_cache()
     skins = []
     for offer in offers:
@@ -168,7 +171,12 @@ def _parse_nm(sf):
             "offer_id": b_oid, "icon": sd.get("icon"), "color": sd.get("color", 0xFF4655),
             "is_nm": True,
         })
-    return skins, bs.get("BonusStoreRemainingDurationInSeconds", 0)
+    # Take the largest "remaining duration"-ish field — the per-offer key is a
+    # short rotation timer, the store-level one is the real end date.
+    durations = [v for k, v in bs.items()
+                 if "remaining" in k.lower() and "duration" in k.lower()
+                 and isinstance(v, (int, float))]
+    return skins, max(durations) if durations else 0
 
 def _parse_bundles(sf):
     """Returns list of {name, image, items, remaining} — one per active bundle."""
@@ -325,8 +333,13 @@ async def _account_autocomplete(interaction: discord.Interaction, current: str):
 
 # ── Embed builders ────────────────────────────────────────────────────────────
 def fmt_time(secs):
-    h, r = divmod(max(0, int(secs)), 3600)
-    return f"{h}h {r // 60}m" if h else f"{r // 60}m"
+    secs = max(0, int(secs))
+    d, r = divmod(secs, 86400)
+    h, r = divmod(r, 3600)
+    m    = r // 60
+    if d:
+        return f"{d}d {h}h"
+    return f"{h}h {m}m" if h else f"{m}m"
 
 def _shop_embeds(skins, remaining, vp, label=None):
     head = f"**👤 {label}**\n" if label else ""
@@ -361,10 +374,25 @@ def _confirm_embed(skin, vp):
 
 
 # ── Night Market reveal view ──────────────────────────────────────────────────
+# The in-game night market shows each card's rarity as a colored border before
+# it's flipped. Discord buttons can't take arbitrary colors, so rarity rides
+# along as an emoji dot instead — same information, closest available analog.
+RARITY_DOTS = {
+    0x5a9fe1: "🔵",   # Select
+    0x009984: "🟢",   # Deluxe
+    0xd1538c: "🟣",   # Premium
+    0xf9d563: "🟡",   # Ultra
+    0xf99358: "🟠",   # Exclusive
+}
+
+def _dot(skin):
+    return RARITY_DOTS.get(skin.get("color"), "⚪")
+
+
 class RevealButton(discord.ui.Button):
     def __init__(self, idx, skin, uid):
         super().__init__(label=f"#{idx + 1}", style=discord.ButtonStyle.secondary,
-                         emoji="🎴", row=idx // 3)
+                         emoji=_dot(skin), row=idx // 3)
         self.idx  = idx
         self.skin = skin
         self.uid  = uid
@@ -373,32 +401,102 @@ class RevealButton(discord.ui.Button):
         if str(interaction.user.id) != self.uid:
             await interaction.response.send_message("Not your night market!", ephemeral=True)
             return
-        s = self.skin
-        self.label    = s["name"][:22]
-        self.style    = discord.ButtonStyle.success
-        self.emoji    = None
+        self.view.reveal(self.idx)
+        await interaction.response.edit_message(embed=self.view.build_embed(), view=self.view)
+
+
+class RevealAllButton(discord.ui.Button):
+    def __init__(self, uid, row):
+        super().__init__(label="Reveal all", style=discord.ButtonStyle.primary,
+                         emoji="✨", row=row)
+        self.uid = uid
+
+    async def callback(self, interaction: discord.Interaction):
+        if str(interaction.user.id) != self.uid:
+            await interaction.response.send_message("Not your night market!", ephemeral=True)
+            return
+        for i in range(len(self.view.skins)):
+            self.view.reveal(i)
         self.disabled = True
-
-        e = discord.Embed(
-            title=f"🎴  {s['name']}",
-            description=(
-                f"~~{s['orig_vp']:,} VP~~ → **{s['vp']:,} VP**\n"
-                f"**-{s['disc_pct']}% off**"
-            ),
-            color=s["color"],
-        )
-        if s.get("icon"):
-            e.set_thumbnail(url=s["icon"])
-
-        await interaction.response.edit_message(view=self.view)
-        await interaction.followup.send(embed=e)
+        await interaction.response.edit_message(embed=self.view.build_embed(), view=self.view)
 
 
 class NMRevealView(discord.ui.View):
-    def __init__(self, uid, nm_skins):
-        super().__init__(timeout=600)
+    def __init__(self, uid, nm_skins, remaining, vp, label=None):
+        super().__init__(timeout=900)
+        self.uid       = uid
+        self.skins     = nm_skins
+        self.remaining = remaining
+        self.vp        = vp
+        self.label     = label
+        self.revealed  = set()
+        self.message   = None
+        self._buttons  = []
         for i, skin in enumerate(nm_skins):
-            self.add_item(RevealButton(i, skin, uid))
+            b = RevealButton(i, skin, uid)
+            self._buttons.append(b)
+            self.add_item(b)
+        self.add_item(RevealAllButton(uid, row=(len(nm_skins) - 1) // 3 + 1))
+
+    def reveal(self, idx):
+        """Flip a card: mark revealed and turn its button into the skin name."""
+        if idx in self.revealed:
+            return
+        self.revealed.add(idx)
+        b = self._buttons[idx]
+        b.label    = self.skins[idx]["name"][:24]
+        b.style    = discord.ButtonStyle.success
+        b.disabled = True
+
+    def build_embed(self):
+        lines, saved = [], 0
+        for i, s in enumerate(self.skins):
+            if i in self.revealed:
+                saved += s["orig_vp"] - s["vp"]
+                lines.append(
+                    f"{_dot(s)} **{s['name']}**\n"
+                    f"⠀⠀~~{s['orig_vp']:,}~~ → **{s['vp']:,} VP**  ·  `-{s['disc_pct']}%`"
+                )
+            else:
+                lines.append(f"{_dot(s)} `#{i + 1}`  ·  *hidden*")
+
+        n    = len(self.revealed)
+        head = f"**👤 {self.label}**\n" if self.label else ""
+        # embed takes on the best revealed rarity, so a good pull is visible at a glance
+        color = 0x202225
+        if self.revealed:
+            best  = max((self.skins[i] for i in self.revealed), key=lambda s: s["orig_vp"] - s["vp"])
+            color = best["color"]
+
+        desc = (
+            f"{head}"
+            f"**🌙 Night Market**\n"
+            f"⏱ Ends in **{fmt_time(self.remaining)}**  ·  💰 **{self.vp:,} VP**\n"
+            f"🎴 Revealed **{n}/{len(self.skins)}**"
+            + (f"  ·  📉 Saving **{saved:,} VP**" if saved else "")
+            + "\n\n" + "\n".join(lines)
+        )
+        e = discord.Embed(description=desc, color=color)
+        if n == len(self.skins):
+            e.set_footer(text="All cards revealed · use /buy <name> to purchase")
+        else:
+            e.set_footer(text="Tap a card to flip it — the dot is its rarity")
+        # show the art of the best reveal so far
+        if self.revealed:
+            best_icon = max((self.skins[i] for i in self.revealed),
+                            key=lambda s: s["orig_vp"] - s["vp"]).get("icon")
+            if best_icon:
+                e.set_thumbnail(url=best_icon)
+        return e
+
+    async def on_timeout(self):
+        for c in self.children:
+            c.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
 
 
 # ── Buy confirmation buttons ──────────────────────────────────────────────────
@@ -559,18 +657,10 @@ async def cmd_nm(interaction: discord.Interaction, account: str = None):
             return
 
         label = _account_label(acct, idx) if len(_accounts.get(uid, [])) > 1 else None
-        head  = f"**👤 {label}**\n" if label else ""
-        header = discord.Embed(
-            description=(
-                f"{head}"
-                f"**🌙 Night Market**\n"
-                f"⏱ Ends in **{fmt_time(nm_rem)}**  ·  💰 **{vp:,} VP**\n\n"
-                f"Tap a card to reveal it."
-            ),
-            color=0x202225,
-        )
-        await interaction.followup.send(embed=header, view=NMRevealView(uid, nm_skins))
-        log(f"NM reveal sent to {uid[:10]}...")
+        view  = NMRevealView(uid, nm_skins, nm_rem, vp, label)
+        view.message = await interaction.followup.send(
+            embed=view.build_embed(), view=view, wait=True)
+        log(f"NM reveal sent to {uid[:10]}... ({len(nm_skins)} cards, {fmt_time(nm_rem)} left)")
     except Exception as e:
         await interaction.followup.send(f"❌ Failed: `{e}`")
 
